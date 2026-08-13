@@ -180,11 +180,13 @@ g:simpleremote_clipboard_max_bytes      number  default: 1048576
 TREE ROOT INTEGRATION                           *simpleremote-tree-root*
 
   e     Use the selected remote directory (or file parent) as the tree root.
-  U     Move the tree root to its parent, stopping at the workspace root.
-  C     Prompt for an absolute directory inside the remote workspace.
+  U     Move the tree root to its parent, up to the remote filesystem root.
+  C     Prompt for any absolute remote directory.
   .     Restore the connected workspace root.
 
 *:SimpleRemoteTreeRoot* {path}
         Set the visible tree root without changing the connection or LSP
         workspace.  Mounted SimpleTree roots synchronize through
-        SimpleTreeRootChanged and simpletree#ExternalSetRoot().
+        SimpleTreeRootChanged and simpletree#ExternalSetRoot().  Browsing
+        outside a workspace-only mount switches to the virtual remote tree;
+        returning inside restores the local SimpleTree projection.

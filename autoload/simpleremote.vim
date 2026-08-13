@@ -1688,8 +1688,8 @@ def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
     return false
   endif
   var target = NormalizeTreeRoot(path)
-  if empty(target) || !UnderRoot(target, s_remote.root)
-    Error('[SimpleRemote] tree root must stay inside workspace: ' .. s_remote.root)
+  if empty(target)
+    Error('[SimpleRemote] tree root must be an absolute remote path')
     return false
   endif
   s_remote.tree_root = target
@@ -1700,13 +1700,26 @@ def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
     mode: get(s_remote, 'workspace_mode', 'virtual'),
   })
   var local_root = get(s_remote, 'local_root', '')
-  if sync_view && !empty(local_root) && SimpleTreeVisible()
-        && exists('*simpletree#ExternalSetRoot') == 1
+  if sync_view && !empty(local_root) && UnderRoot(target, s_remote.root)
+        && SimpleTreeVisible() && exists('*simpletree#ExternalSetRoot') == 1
     var local_target = RemoteTreeLocalPath(target)
     if !simpletree#ExternalSetRoot(local_target)
       Error('[SimpleRemote] local tree root is unavailable: ' .. local_target)
       return false
     endif
+  elseif sync_view && !empty(local_root) && UnderRoot(target, s_remote.root)
+    CloseRemoteTree()
+    var local_target = RemoteTreeLocalPath(target)
+    if exists(':SimpleTree') == 2
+      execute 'SimpleTree ' .. fnameescape(local_target)
+    elseif exists(':Explore') == 2
+      execute 'Explore ' .. fnameescape(local_target)
+    endif
+  elseif sync_view && !empty(local_root)
+    if SimpleTreeVisible() && exists(':SimpleTreeClose') == 2
+      silent! execute 'SimpleTreeClose'
+    endif
+    OpenRemoteTree(target)
   elseif !empty(s_tree)
     LoadRemoteTree(target)
   endif
@@ -1725,8 +1738,8 @@ enddef
 
 def RemoteTreeRootUp()
   var current = get(s_tree, 'root', get(s_remote, 'tree_root', s_remote.root))
-  if current ==# s_remote.root
-    echomsg '[SimpleRemote] already at workspace root'
+  if current ==# '/'
+    echomsg '[SimpleRemote] already at remote filesystem root'
     return
   endif
   SetRemoteTreeRoot(RemoteParent(current))
@@ -1911,6 +1924,9 @@ def CopyRemoteTreeFileOut()
     command = [daemon, 'download', '--kind', s_remote.kind,
       '--target', s_remote.target, '--root', s_remote.root,
       '--remote', node.path, '--local', destination]
+    if !UnderRoot(node.path, s_remote.root)
+      add(command, '--allow-outside-root')
+    endif
     if force
       add(command, '--force')
     endif
@@ -2009,6 +2025,10 @@ def OpenWorkspaceTree()
   var local_root = get(s_remote, 'local_root', '')
   if !empty(local_root)
     var remote_tree_root = get(s_remote, 'tree_root', s_remote.root)
+    if !UnderRoot(remote_tree_root, s_remote.root)
+      OpenRemoteTree(remote_tree_root)
+      return
+    endif
     var local_tree_root = RemoteTreeLocalPath(remote_tree_root)
     CloseRemoteTree()
     if exists(':SimpleTree') == 2

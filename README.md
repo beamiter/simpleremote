@@ -60,7 +60,8 @@ Set `g:simpleremote_copy_destination` for a fixed local drop directory or
 
 The remote tree also shares SimpleTree's root-navigation vocabulary without
 changing the connected workspace or restarting SimpleCC: `e` uses the selected
-directory, `U` moves to its parent, `C` prompts for a remote directory, and `.`
-returns to the workspace root. Roots are constrained to the connected
-workspace. Mounted SimpleTree roots synchronize through `SimpleTreeRootChanged`
-and `simpletree#ExternalSetRoot()`.
+directory, `U` moves to its parent up to `/`, `C` accepts any absolute remote
+directory, and `.` returns to the workspace root. The connection and LSP keep
+their original project root while the tree browses elsewhere. When an SSHFS or
+bind mount covers only the workspace, browsing outside it automatically uses
+the virtual remote tree and returning inside restores the local SimpleTree.

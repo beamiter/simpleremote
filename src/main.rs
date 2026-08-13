@@ -19,6 +19,7 @@ struct RuntimeArgs {
     remote: String,
     local: String,
     force: bool,
+    allow_outside_root: bool,
     command: Vec<String>,
 }
 
@@ -89,6 +90,11 @@ fn parse_args(values: Vec<String>) -> Result<RuntimeArgs, String> {
             index += 1;
             continue;
         }
+        if values[index] == "--allow-outside-root" {
+            parsed.allow_outside_root = true;
+            index += 1;
+            continue;
+        }
         let option = values[index].as_str();
         let value = values
             .get(index + 1)
@@ -129,11 +135,13 @@ fn validate(args: &RuntimeArgs, action: &str) -> Result<(), String> {
     if action == "download" {
         let remote = Path::new(&args.remote);
         let root = Path::new(&args.root);
-        if !remote.is_absolute()
-            || remote.components().any(|part| part == Component::ParentDir)
-            || !remote.starts_with(root)
-        {
-            return Err("--remote must be an absolute path inside --root".to_string());
+        if !remote.is_absolute() || remote.components().any(|part| part == Component::ParentDir) {
+            return Err("--remote must be an absolute normalized path".to_string());
+        }
+        if !args.allow_outside_root && !remote.starts_with(root) {
+            return Err(
+                "--remote must stay inside --root (or pass --allow-outside-root)".to_string(),
+            );
         }
         if args.local.is_empty() {
             return Err("--local is required".to_string());
@@ -146,7 +154,7 @@ fn transport_command(args: &RuntimeArgs, action: &str) -> Result<Command, String
     let script = match action {
         "agent" => agent_script(&args.agent),
         "probe" => probe_script(&args.root),
-        "download" => download_script(&args.root, &args.remote),
+        "download" => download_script(&args.root, &args.remote, args.allow_outside_root),
         _ => exec_script(&args.root, &args.command),
     };
     if args.kind == "docker" {
@@ -212,12 +220,18 @@ fn probe_script(root: &str) -> String {
     )
 }
 
-fn download_script(root: &str, remote: &str) -> String {
+fn download_script(root: &str, remote: &str, allow_outside_root: bool) -> String {
+    let boundary = if allow_outside_root {
+        String::new()
+    } else {
+        "if [ \"$base\" != / ]; then case \"$file\" in \"$base\"/*) ;; *) printf 'remote file leaves workspace: %s\\n' \"$file\" >&2; exit 46;; esac; fi; ".to_string()
+    };
     format!(
-        "{}; base=$(pwd -P) || exit 44; file=$(readlink -f -- {} 2>/dev/null) || {{ printf 'cannot resolve remote file: %s\\n' {} >&2; exit 45; }}; if [ \"$base\" != / ]; then case \"$file\" in \"$base\"/*) ;; *) printf 'remote file leaves workspace: %s\\n' \"$file\" >&2; exit 46;; esac; fi; [ -f \"$file\" ] || {{ printf 'not a regular file: %s\\n' \"$file\" >&2; exit 45; }}; exec cat -- \"$file\"",
+        "{}; base=$(pwd -P) || exit 44; file=$(readlink -f -- {} 2>/dev/null) || {{ printf 'cannot resolve remote file: %s\\n' {} >&2; exit 45; }}; {}[ -f \"$file\" ] || {{ printf 'not a regular file: %s\\n' \"$file\" >&2; exit 45; }}; exec cat -- \"$file\"",
         workspace_prelude(root),
         shell_quote(remote),
         shell_quote(remote),
+        boundary,
     )
 }
 
@@ -415,5 +429,11 @@ mod tests {
             ..RuntimeArgs::default()
         };
         assert!(validate(&args, "download").is_err());
+        let allowed = RuntimeArgs {
+            allow_outside_root: true,
+            remote: "/outside/file".into(),
+            ..args
+        };
+        assert!(validate(&allowed, "download").is_ok());
     }
 }
