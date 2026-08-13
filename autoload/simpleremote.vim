@@ -1205,47 +1205,296 @@ def RemoteParent(path: string): string
   return empty(parent) ? '/' : parent
 enddef
 
-def RenderRemoteTree(buf: number, path: string, ok: bool, body: string)
+def TreeIcons(): dict<any>
+  var icons = get(g:, 'simpleremote_tree_use_nerdfont', 1) ? {
+    root: '󰉋', ssh: '󰣀', docker: '', dir: '', dir_open: '',
+    file: '', link: '', loading: '', error: '',
+    branch: '├─ ', last: '└─ ', vertical: '│  ', blank: '   ',
+  } : {
+    root: '#', ssh: '@', docker: 'D', dir: '>', dir_open: 'v',
+    file: '-', link: '@', loading: '~', error: '!',
+    branch: '|- ', last: '`- ', vertical: '|  ', blank: '   ',
+  }
+  return extend(icons, get(g:, 'simpleremote_tree_icons', {}), 'force')
+enddef
+
+def TreeFileIcon(name: string, icons: dict<any>): string
+  if !get(g:, 'simpleremote_tree_show_file_icons', 1)
+    return icons.file
+  endif
+  var special = {
+    'readme.md': '󰂺', 'license': '', 'makefile': '',
+    'dockerfile': '', '.gitignore': '', '.gitattributes': '',
+  }
+  var lower = tolower(name)
+  if has_key(special, lower)
+    return special[lower]
+  endif
+  var map = {
+    vim: '', lua: '', py: '', js: '', jsx: '', ts: '', tsx: '',
+    rs: '', go: '', c: '', h: '', cpp: '', cc: '', hpp: '',
+    java: '', rb: '', php: '', sh: '', bash: '', zsh: '',
+    html: '', css: '', scss: '', json: '', yaml: '', yml: '',
+    toml: '', xml: '󰗀', md: '', txt: '󰈙', pdf: '',
+    png: '', jpg: '', jpeg: '', gif: '', svg: '󰜡', webp: '',
+    zip: '', gz: '', tar: '', xz: '', lock: '󰌾',
+  }
+  var override = get(g:, 'simpleremote_tree_file_icon_map', {})
+  if type(override) == v:t_dict
+    extend(map, override, 'force')
+  endif
+  var ext = tolower(fnamemodify(name, ':e'))
+  return get(map, ext, icons.file)
+enddef
+
+def TreeEllipsize(value: string, width: number, from_left: bool = false): string
+  if width <= 1 || strdisplaywidth(value) <= width
+    return value
+  endif
+  var keep = max([1, width - 1])
+  return from_left
+    ? '…' .. strcharpart(value, max([0, strchars(value) - keep]))
+    : strcharpart(value, 0, keep) .. '…'
+enddef
+
+def TreeWidth(): number
+  var winid = get(s_tree, 'buf', -1)->bufwinid()
+  return winid > 0 ? max([20, winwidth(winid) - 2])
+    : max([20, get(g:, 'simpleremote_tree_width', 40) - 2])
+enddef
+
+def TreeHeader(): list<string>
+  var icons = TreeIcons()
+  var width = TreeWidth()
+  var root = get(s_tree, 'root', get(s_remote, 'root', '/'))
+  var title = root ==# '/' ? '/' : fnamemodify(root, ':t')
+  var profile = get(get(s_remote, 'options', {}), 'name', '')
+  var target = empty(profile) ? substitute(s_remote.target, '^[^@]\+@', '', '')
+    : profile
+  var transport_icon = s_remote.kind ==# 'docker' ? icons.docker : icons.ssh
+  return [
+    ' ' .. icons.root .. '  ' .. TreeEllipsize(title, width - 4),
+    ' ' .. transport_icon .. '  ' .. toupper(s_remote.kind) .. ' · '
+      .. TreeEllipsize(target, width - 10),
+    '    ' .. TreeEllipsize(root, width - 4, true),
+    '',
+  ]
+enddef
+
+def TreeIgnored(name: string): bool
+  if !get(g:, 'simpleremote_tree_show_hidden', 1) && name =~# '^\.'
+    return true
+  endif
+  for pattern in get(g:, 'simpleremote_tree_ignore', [])
+    if type(pattern) == v:t_string && name =~# glob2regpat(pattern)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def ParseTreeDirectory(path: string, body: string): list<dict<any>>
+  var directories: list<dict<any>> = []
+  var files: list<dict<any>> = []
+  for line in split(body, '\n')
+    var fields = split(line, "\t", 1)
+    if len(fields) < 2 || empty(fields[0]) || TreeIgnored(fields[0])
+      continue
+    endif
+    var node = {
+      name: fields[0],
+      path: JoinRemotePath(path, fields[0]),
+      type: fields[1],
+    }
+    if node.type ==# 'd'
+      add(directories, node)
+    else
+      add(files, node)
+    endif
+  endfor
+  sort(directories, (a, b) => stricmp(a.name, b.name))
+  sort(files, (a, b) => stricmp(a.name, b.name))
+  return directories + files
+enddef
+
+def TreeStatusRank(status: string): number
+  return get({conflict: 5, deleted: 4, staged: 3, modified: 2, untracked: 1},
+    status, 0)
+enddef
+
+def TreeGitStatus(code: string): string
+  if code =~# 'U' || code ==# 'AA' || code ==# 'DD'
+    return 'conflict'
+  elseif code ==# '??'
+    return 'untracked'
+  elseif code =~# 'D'
+    return 'deleted'
+  elseif strpart(code, 0, 1) !=# ' '
+    return 'staged'
+  elseif strpart(code, 1, 1) !=# ' '
+    return 'modified'
+  endif
+  return ''
+enddef
+
+def OnTreeGit(generation: number, epoch: number, ok: bool, body: string)
+  if !ok || !IsCurrent(generation) || empty(s_tree)
+        || get(s_tree, 'epoch', -1) != epoch
+    return
+  endif
+  var root = s_tree.root
+  var statuses: dict<string> = {}
+  for line in split(body, '\n', 1)
+    if len(line) < 4
+      continue
+    endif
+    var status = TreeGitStatus(strpart(line, 0, 2))
+    var relative = strpart(line, 3)
+    if empty(status) || empty(relative)
+      continue
+    endif
+    if relative =~# ' -> '
+      relative = split(relative, ' -> ', 1)[-1]
+    endif
+    var path = JoinRemotePath(root, relative)
+    statuses[path] = status
+    var parent = RemoteParent(path)
+    while parent !=# root && UnderRoot(parent, root)
+      if TreeStatusRank(status) > TreeStatusRank(get(statuses, parent, ''))
+        statuses[parent] = status
+      endif
+      parent = RemoteParent(parent)
+    endwhile
+  endfor
+  s_tree.git = statuses
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def LoadTreeGit()
+  if !get(g:, 'simpleremote_tree_show_git_status', 1) || empty(s_tree)
+    return
+  endif
+  var generation = s_remote.generation
+  var epoch = s_tree.epoch
+  var root = s_tree.root
+  var command = 'cd ' .. shellescape(root)
+    .. ' && if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then '
+    .. 'git -c core.quotepath=false status --porcelain=v1 --untracked-files=all; fi'
+  Send('exec', command,
+    (ok, body) => OnTreeGit(generation, epoch, ok, body))
+enddef
+
+def TreePrefix(ancestors: list<bool>, last: bool, icons: dict<any>): string
+  var prefix = ''
+  for ancestor_last in ancestors
+    prefix ..= ancestor_last ? icons.blank : icons.vertical
+  endfor
+  return prefix .. (last ? icons.last : icons.branch)
+enddef
+
+def TreeBadge(status: string): string
+  return get({conflict: '!', deleted: 'D', staged: '+', modified: 'M',
+    untracked: '?'}, status, '')
+enddef
+
+def AddTreeAuxLine(prefix: string, text: string, lines: list<string>,
+    nodes: list<dict<any>>)
+  add(lines, prefix .. text)
+  add(nodes, {})
+enddef
+
+def AppendTreeChildren(parent: string, ancestors: list<bool>,
+    lines: list<string>, nodes: list<dict<any>>)
+  var icons = TreeIcons()
+  var children = get(get(s_tree, 'cache', {}), parent, [])
+  for index in range(0, len(children) - 1)
+    var node = copy(children[index])
+    var last = index == len(children) - 1
+    var prefix = TreePrefix(ancestors, last, icons)
+    var expanded = node.type ==# 'd' && has_key(s_tree.expanded, node.path)
+    var icon = node.type ==# 'd' ? (expanded ? icons.dir_open : icons.dir)
+      : node.type ==# 'l' ? icons.link : TreeFileIcon(node.name, icons)
+    var suffix = node.type ==# 'd' ? '/' : node.type ==# 'l' ? '@' : ''
+    var status = get(get(s_tree, 'git', {}), node.path, '')
+    var body = prefix .. icon .. ' ' .. node.name .. suffix
+    var badge = TreeBadge(status)
+    if !empty(badge)
+      body ..= repeat(' ', max([2, TreeWidth() - strdisplaywidth(body) - 1])) .. badge
+    endif
+    node.expanded = expanded
+    node.parent = parent
+    node.status = status
+    add(lines, body)
+    add(nodes, node)
+    if !expanded
+      continue
+    endif
+    var child_prefix = ''
+    for ancestor_last in ancestors + [last]
+      child_prefix ..= ancestor_last ? icons.blank : icons.vertical
+    endfor
+    if has_key(get(s_tree, 'errors', {}), node.path)
+      AddTreeAuxLine(child_prefix .. icons.error .. ' ',
+        s_tree.errors[node.path], lines, nodes)
+    elseif has_key(get(s_tree, 'cache', {}), node.path)
+      AppendTreeChildren(node.path, ancestors + [last], lines, nodes)
+    else
+      AddTreeAuxLine(child_prefix .. icons.loading .. ' ', 'loading…', lines, nodes)
+    endif
+  endfor
+enddef
+
+def SetupRemoteTreeSyntax()
+  highlight default link SimpleRemoteTreeTitle Title
+  highlight default link SimpleRemoteTreeMeta Comment
+  highlight default link SimpleRemoteTreePath Directory
+  highlight default link SimpleRemoteTreeGuide NonText
+  highlight default link SimpleRemoteTreeDirectory Directory
+  highlight default link SimpleRemoteTreeHidden Comment
+  highlight default link SimpleRemoteTreeLoading WarningMsg
+  highlight default link SimpleRemoteTreeGitModified WarningMsg
+  highlight default link SimpleRemoteTreeGitStaged DiffAdd
+  highlight default link SimpleRemoteTreeGitUntracked Comment
+  highlight default link SimpleRemoteTreeGitConflict ErrorMsg
+  highlight default link SimpleRemoteTreeGitDeleted DiffDelete
+  syntax clear
+  syntax match SimpleRemoteTreeTitle /\%1l.*/
+  syntax match SimpleRemoteTreeMeta /\%2l.*/
+  syntax match SimpleRemoteTreePath /\%3l.*/
+  syntax match SimpleRemoteTreeGuide /[│├└─]/
+  syntax match SimpleRemoteTreeDirectory /^.*\/\%(\s\+[M+?!D]\)\?$/
+  syntax match SimpleRemoteTreeHidden /\s\zs\.[^/[:space:]]*/
+  syntax match SimpleRemoteTreeLoading /loading…$/
+  syntax match SimpleRemoteTreeGitModified /M$/
+  syntax match SimpleRemoteTreeGitStaged /+$/
+  syntax match SimpleRemoteTreeGitUntracked /?$/
+  syntax match SimpleRemoteTreeGitConflict /!$/
+  syntax match SimpleRemoteTreeGitDeleted /D$/
+enddef
+
+def RenderRemoteTree(buf: number)
   if !bufexists(buf) || get(s_tree, 'buf', -1) != buf
     return
   endif
-  var lines = [
-    printf('SimpleRemote  %s:%s', s_remote.kind, s_remote.target),
-    path,
-    '',
-  ]
-  var nodes: list<dict<any>> = [{}, {}, {}]
-  if !ok
-    add(lines, '! ' .. body)
-    add(nodes, {})
+  var lines = TreeHeader()
+  var nodes: list<dict<any>> = [{}, {}, {}, {}]
+  var root = s_tree.root
+  var icons = TreeIcons()
+  if has_key(get(s_tree, 'errors', {}), root)
+    AddTreeAuxLine(icons.error .. ' ', s_tree.errors[root], lines, nodes)
+  elseif has_key(get(s_tree, 'cache', {}), root)
+    AppendTreeChildren(root, [], lines, nodes)
   else
-    if path !=# '/'
-      add(lines, '../')
-      add(nodes, {name: '..', path: RemoteParent(path), type: 'd'})
+    AddTreeAuxLine(icons.loading .. ' ', 'loading…', lines, nodes)
+  endif
+  var focus_path = get(s_tree, 'reveal', '')
+  var winid = bufwinid(buf)
+  if empty(focus_path) && winid > 0
+    var old_line = getcurpos(winid)[1] - 1
+    var old_nodes = getbufvar(buf, 'simpleremote_tree_nodes', [])
+    if old_line >= 0 && old_line < len(old_nodes)
+      focus_path = get(old_nodes[old_line], 'path', '')
     endif
-    var directories: list<dict<any>> = []
-    var files: list<dict<any>> = []
-    for line in split(body, '\n')
-      var fields = split(line, "\t", 1)
-      if len(fields) < 2 || empty(fields[0])
-        continue
-      endif
-      var node = {
-        name: fields[0],
-        path: JoinRemotePath(path, fields[0]),
-        type: fields[1],
-      }
-      if fields[1] ==# 'd'
-        add(directories, node)
-      else
-        add(files, node)
-      endif
-    endfor
-    for node in directories + files
-      add(lines, (node.type ==# 'd' ? '+ ' : '  ') .. node.name
-        .. (node.type ==# 'd' ? '/' : ''))
-      add(nodes, node)
-    endfor
   endif
   setbufvar(buf, '&modifiable', 1)
   setbufline(buf, 1, lines)
@@ -1254,13 +1503,11 @@ def RenderRemoteTree(buf: number, path: string, ok: bool, body: string)
     deletebufline(buf, len(lines) + 1, old_count)
   endif
   setbufvar(buf, 'simpleremote_tree_nodes', nodes)
-  setbufvar(buf, 'simpleremote_tree_path', path)
+  setbufvar(buf, 'simpleremote_tree_path', root)
   setbufvar(buf, '&modifiable', 0)
-  var reveal = get(s_tree, 'reveal', '')
-  if !empty(reveal)
+  if !empty(focus_path)
     for index in range(0, len(nodes) - 1)
-      if get(nodes[index], 'path', '') ==# reveal
-        var winid = bufwinid(buf)
+      if get(nodes[index], 'path', '') ==# focus_path
         if winid > 0
           win_execute(winid, printf('cursor(%d, 1)', index + 1))
         endif
@@ -1271,20 +1518,76 @@ def RenderRemoteTree(buf: number, path: string, ok: bool, body: string)
   endif
 enddef
 
+def OnTreeList(generation: number, epoch: number, buf: number, path: string,
+    ok: bool, body: string)
+  if !IsCurrent(generation) || !bufexists(buf) || empty(s_tree)
+        || s_tree.buf != buf || s_tree.epoch != epoch
+    return
+  endif
+  if has_key(s_tree.loading, path)
+    remove(s_tree.loading, path)
+  endif
+  if ok
+    s_tree.cache[path] = ParseTreeDirectory(path, body)
+    if has_key(s_tree.errors, path)
+      remove(s_tree.errors, path)
+    endif
+  else
+    s_tree.errors[path] = body
+  endif
+  RenderRemoteTree(buf)
+enddef
+
+def LoadTreeDirectory(path: string, force: bool = false)
+  if !IsReady() || empty(s_tree)
+    return
+  endif
+  if !force && has_key(s_tree.cache, path)
+    RenderRemoteTree(s_tree.buf)
+    return
+  endif
+  if has_key(s_tree.loading, path)
+    return
+  endif
+  s_tree.loading[path] = true
+  var generation = s_remote.generation
+  var epoch = s_tree.epoch
+  var buf = s_tree.buf
+  RenderRemoteTree(buf)
+  Send('list', path,
+    (ok, body) => OnTreeList(generation, epoch, buf, path, ok, body))
+enddef
+
 def LoadRemoteTree(path: string)
   if !IsReady() || empty(s_tree)
     return
   endif
-  var buf = s_tree.buf
-  setbufvar(buf, '&modifiable', 1)
-  setbufline(buf, 1, [
-    printf('SimpleRemote  %s:%s', s_remote.kind, s_remote.target),
-    path,
-    '',
-    '  loading...',
-  ])
-  setbufvar(buf, '&modifiable', 0)
-  Send('list', path, (ok, body) => RenderRemoteTree(buf, path, ok, body))
+  if get(s_tree, 'root', '') !=# path
+    s_tree.epoch += 1
+    s_tree.root = path
+    s_tree.cache = {}
+    s_tree.loading = {}
+    s_tree.errors = {}
+    s_tree.git = {}
+    s_tree.expanded = {path: true}
+  endif
+  LoadTreeDirectory(path)
+  LoadTreeGit()
+enddef
+
+def RefreshRemoteTree()
+  if empty(s_tree)
+    return
+  endif
+  var root = s_tree.root
+  s_tree.epoch += 1
+  s_tree.cache = {}
+  s_tree.loading = {}
+  s_tree.errors = {}
+  s_tree.git = {}
+  s_tree.expanded = {root: true}
+  LoadTreeDirectory(root, true)
+  LoadTreeGit()
 enddef
 
 def OpenRemoteTree(path: string, reveal: string = '')
@@ -1312,6 +1615,7 @@ def OpenRemoteTree(path: string, reveal: string = '')
   setlocal cursorline nomodified
   &l:filetype = 'simpleremotetree'
   &l:statusline = '%{g:SimpleRemoteTreeStatusline()}'
+  SetupRemoteTreeSyntax()
   nnoremap <silent><buffer> q <Cmd>call g:SimpleRemoteTreeClose()<CR>
   nnoremap <silent><buffer> <Esc> <Cmd>call g:SimpleRemoteTreeClose()<CR>
   nnoremap <silent><buffer> <CR> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
@@ -1322,7 +1626,18 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> h <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <BS> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
-  s_tree = {buf: buf, source_win: source_win, reveal: reveal}
+  s_tree = {
+    buf: buf,
+    source_win: source_win,
+    reveal: reveal,
+    root: path,
+    epoch: 1,
+    cache: {},
+    loading: {},
+    errors: {},
+    git: {},
+    expanded: {path: true},
+  }
   LoadRemoteTree(path)
 enddef
 
@@ -1356,7 +1671,13 @@ def RemoteTreeActivate(action: string)
   endif
   var node = nodes[index]
   if node.type ==# 'd'
-    LoadRemoteTree(node.path)
+    if get(node, 'expanded', false)
+      remove(s_tree.expanded, node.path)
+      RenderRemoteTree(s_tree.buf)
+    else
+      s_tree.expanded[node.path] = true
+      LoadTreeDirectory(node.path)
+    endif
     return
   endif
   var source_win = get(s_tree, 'source_win', 0)
@@ -1371,6 +1692,25 @@ def RemoteTreeActivate(action: string)
   else
     execute action .. ' ' .. fnameescape('remote://' .. node.path)
   endif
+enddef
+
+def CollapseRemoteTreeNode()
+  var nodes = get(b:, 'simpleremote_tree_nodes', [])
+  var index = line('.') - 1
+  if index < 0 || index >= len(nodes) || empty(nodes[index])
+    return
+  endif
+  var node = nodes[index]
+  var collapse = node.type ==# 'd' && get(node, 'expanded', false)
+    ? node.path : get(node, 'parent', '')
+  if empty(collapse) || collapse ==# s_tree.root
+    return
+  endif
+  if has_key(s_tree.expanded, collapse)
+    remove(s_tree.expanded, collapse)
+  endif
+  s_tree.reveal = collapse
+  RenderRemoteTree(s_tree.buf)
 enddef
 
 def RemoteActions(result: number)
@@ -1540,11 +1880,11 @@ def g:SimpleRemoteTreeActivate(action: string = 'edit')
 enddef
 
 def g:SimpleRemoteTreeParent()
-  LoadRemoteTree(RemoteParent(get(b:, 'simpleremote_tree_path', s_remote.root)))
+  CollapseRemoteTreeNode()
 enddef
 
 def g:SimpleRemoteTreeRefresh()
-  LoadRemoteTree(get(b:, 'simpleremote_tree_path', s_remote.root))
+  RefreshRemoteTree()
 enddef
 
 def g:SimpleRemoteTreeClose()

@@ -28,6 +28,24 @@ endif
 if !exists('g:simpleremote_tree_width')
   g:simpleremote_tree_width = 40
 endif
+if !exists('g:simpleremote_tree_use_nerdfont')
+  g:simpleremote_tree_use_nerdfont = get(g:, 'simpletree_use_nerdfont', 1)
+endif
+if !exists('g:simpleremote_tree_show_file_icons')
+  g:simpleremote_tree_show_file_icons = 1
+endif
+if !exists('g:simpleremote_tree_show_git_status')
+  g:simpleremote_tree_show_git_status = 1
+endif
+if !exists('g:simpleremote_tree_show_hidden')
+  g:simpleremote_tree_show_hidden = 1
+endif
+if !exists('g:simpleremote_tree_ignore')
+  g:simpleremote_tree_ignore = [
+    '.git', '.hg', '.svn', '.venv', 'node_modules', '__pycache__',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache',
+  ]
+endif
 if !exists('g:simpleremote_default_root')
   g:simpleremote_default_root = '/'
 endif

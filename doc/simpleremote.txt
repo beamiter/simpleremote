@@ -39,7 +39,10 @@ functions cannot be made transparent in virtual mode.
 :SimpleRemoteDisconnect       Close the active connection and owned mount.
 :SimpleRemoteReconnect        Reconnect the current or most recent target.
 :SimpleRemoteWorkspace [dir]  Open the workspace tree or reconnect at {dir}.
-:SimpleRemoteTree             Toggle SimpleTree/projected tree or virtual tree.
+:SimpleRemoteTree             Toggle SimpleTree/projected tree or the rich
+                              asynchronous virtual tree.  In virtual mode,
+                              <CR>/l expands or opens, h collapses, r refreshes,
+                              and s/v/t open files in split/vsplit/tab.
 :SimpleRemoteTreeReveal       Reveal the current local or remote file.
 :SimpleRemoteOpen {path}      Open a remote path relative to the workspace.
 :SimpleRemoteExec {command}   Execute in the remote workspace root.
@@ -72,6 +75,11 @@ Options:
   g:simpleremote_open_tree_on_connect 1 to open the tree after connecting
   g:simpleremote_default_root         root used by the target picker
   g:simpleremote_tree_width           virtual tree width
+  g:simpleremote_tree_use_nerdfont    use Nerd Font icons (inherits SimpleTree)
+  g:simpleremote_tree_show_file_icons show file-type icons
+  g:simpleremote_tree_show_git_status show right-aligned Git badges
+  g:simpleremote_tree_show_hidden     include dotfiles
+  g:simpleremote_tree_ignore          names/globs hidden from the virtual tree
   g:simpleremote_local_roots          explicit target/root to local mappings
   g:simpleremote_agent                remote agent path
 
