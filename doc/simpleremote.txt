@@ -109,12 +109,20 @@ Events expose their payload in g:simpleremote_event:
 5. PUBLIC API                                    *simpleremote-api*
 
   g:SimpleRemoteConnect(kind, target, root)
+  g:SimpleRemoteRecentWorkspaces([limit])
+  g:SimpleRemoteOpenWorkspace(workspace)
   g:SimpleRemoteWorkspaceRoot()
   g:SimpleRemoteProjectRoot()
   g:SimpleRemoteLocalPath(remote_path)
   g:SimpleRemoteRemotePath(local_path)
   g:SimpleRemoteShellCommand(command)
   g:SimpleRemoteStatusline()
+
+SimpleRemoteRecentWorkspaces() returns normalized workspace dictionaries and
+is the supported integration point for dashboards such as SimpleStartify.
+SimpleRemoteOpenWorkspace() restores one of those complete specifications and
+opens its workspace tree after the connection is ready, even when automatic
+tree opening is disabled.
 
 g:SimpleRemoteShellCommand() returns an argv list suitable for job_start().
 This is the integration boundary for simple* daemons that need to execute on

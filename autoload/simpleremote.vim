@@ -259,7 +259,8 @@ def FinishConnection(generation: number)
   for path in queued
     OpenRemote(path)
   endfor
-  if get(g:, 'simpleremote_open_tree_on_connect', 1) && !mounting
+  if (get(g:, 'simpleremote_open_tree_on_connect', 1)
+      || get(get(s_remote, 'options', {}), 'open_tree', false)) && !mounting
     timer_start(0, (_) => OpenWorkspaceTree())
   endif
 enddef
@@ -874,6 +875,7 @@ def OnSshfsExit(generation: number, mountpoint: string,
     ActivateProjection(mountpoint, 'sshfs', true)
     echomsg '[SimpleRemote] SSHFS workspace ready: ' .. mountpoint
     if get(g:, 'simpleremote_open_tree_on_connect', 1)
+        || get(get(s_remote, 'options', {}), 'open_tree', false)
       timer_start(0, (_) => OpenWorkspaceTree())
     endif
     return
@@ -881,6 +883,7 @@ def OnSshfsExit(generation: number, mountpoint: string,
   PublishWorkspace('virtual')
   echomsg '[SimpleRemote] SSHFS unavailable; using virtual workspace'
   if get(g:, 'simpleremote_open_tree_on_connect', 1)
+      || get(get(s_remote, 'options', {}), 'open_tree', false)
     timer_start(0, (_) => OpenWorkspaceTree())
   endif
 enddef
@@ -1957,6 +1960,41 @@ def g:SimpleRemoteActivateLocalBuffer()
   b:simpleremote_path = s_remote.root ==# '/'
     ? '/' .. substitute(suffix, '^/', '', '')
     : s_remote.root .. suffix
+enddef
+
+def g:SimpleRemoteRecentWorkspaces(limit: number = -1): list<dict<any>>
+  var result: list<dict<any>> = []
+  if limit == 0
+    return result
+  endif
+
+  for value in RecentSpecs()
+    var spec = NormalizeSpec(value)
+    if empty(spec) || get(spec, 'root', '') !~# '^/'
+      continue
+    endif
+    add(result, {
+      name: get(spec, 'name', ''),
+      kind: spec.kind,
+      target: spec.target,
+      root: spec.root,
+      local_root: get(spec, 'local_root', ''),
+    })
+    if limit >= 0 && len(result) >= limit
+      break
+    endif
+  endfor
+  return result
+enddef
+
+def g:SimpleRemoteOpenWorkspace(workspace: dict<any>)
+  var spec = NormalizeSpec(workspace)
+  if empty(spec) || get(spec, 'root', '') !~# '^/'
+    Error('[SimpleRemote] invalid recent workspace')
+    return
+  endif
+  spec.open_tree = true
+  ConnectSpec(spec)
 enddef
 
 def g:SimpleRemoteWorkspaceRoot(): string
