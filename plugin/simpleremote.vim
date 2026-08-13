@@ -49,8 +49,14 @@ endif
 if !exists('g:simpleremote_default_root')
   g:simpleremote_default_root = '/'
 endif
+if !exists('g:simpleremote_use_daemon')
+  g:simpleremote_use_daemon = 1
+endif
 
 const PLUGIN_ROOT = fnamemodify(expand('<sfile>:p'), ':h:h')
+if !exists('g:simpleremote_daemon_path')
+  g:simpleremote_daemon_path = PLUGIN_ROOT .. '/lib/simpleremote-daemon'
+endif
 execute 'source ' .. fnameescape(PLUGIN_ROOT .. '/autoload/simpleremote.vim')
 
 command! -nargs=0 SimpleRemote call g:SimpleRemoteUI()

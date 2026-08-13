@@ -69,6 +69,8 @@ Define profiles before the plugin is loaded, normally in ~/.vimrc.before:
 <
 Options:
 
+  g:simpleremote_use_daemon          1 to use the Rust transport runtime
+  g:simpleremote_daemon_path         custom simpleremote-daemon executable
   g:simpleremote_workspace_mode       'auto' or 'virtual'
   g:simpleremote_use_sshfs            'auto', 'never', 1, or 0
   g:simpleremote_change_directory     'tab', 'global', or 'none'
@@ -126,6 +128,12 @@ tree opening is disabled.
 
 g:SimpleRemoteShellCommand() returns an argv list suitable for job_start().
 This is the integration boundary for simple* daemons that need to execute on
-the active SSH host or in the active Docker container.
+the active SSH host or in the active Docker container.  With the Rust runtime
+installed, returned commands share its OpenSSH ControlMaster connection.
+
+The workspace dictionary also contains "runtime" when the installed
+simpleremote-daemon is active.  SimpleCC uses that executable as its remote
+LSP stdio transport, while older SimpleRemote or SimpleCC versions continue to
+fall back to direct SSH/Docker commands.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

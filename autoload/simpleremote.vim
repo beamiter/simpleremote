@@ -188,6 +188,14 @@ def AgentPath(): string
     get(g:, 'vimrc_remote_agent', '~/.cache/vimrc/simpleremote-agent.sh'))
 enddef
 
+def DaemonPath(): string
+  if !get(g:, 'simpleremote_use_daemon', 1)
+    return ''
+  endif
+  var path = fnamemodify(expand(get(g:, 'simpleremote_daemon_path', '')), ':p')
+  return executable(path) ? path : ''
+enddef
+
 def ShellLiteral(value: string): string
   return shellescape(value)
 enddef
@@ -200,6 +208,11 @@ def DockerAgentCommand(agent: string): string
 enddef
 
 def TargetCommand(kind: string, target: string, agent: string): list<string>
+  var daemon = DaemonPath()
+  if !empty(daemon)
+    return [daemon, 'agent', '--kind', kind, '--target', target,
+      '--agent', agent]
+  endif
   if kind ==# 'docker'
     return ['docker', 'exec', '-i', target, 'sh', '-c',
       DockerAgentCommand(agent)]
@@ -746,6 +759,7 @@ def WorkspaceSnapshot(): dict<any>
     root: get(s_remote, 'root', ''),
     local_root: get(s_remote, 'local_root', ''),
     mode: get(s_remote, 'workspace_mode', 'virtual'),
+    runtime: DaemonPath(),
     uri: 'remote://' .. get(s_remote, 'root', ''),
   }
 enddef
@@ -2041,6 +2055,12 @@ enddef
 def g:SimpleRemoteShellCommand(command: string): list<string>
   if !IsReady()
     return []
+  endif
+  var daemon = DaemonPath()
+  if !empty(daemon)
+    return [daemon, 'exec', '--kind', s_remote.kind,
+      '--target', s_remote.target, '--root', s_remote.root,
+      '--', 'sh', '-c', command]
   endif
   var script = 'cd ' .. shellescape(s_remote.root) .. ' && ' .. command
   return s_remote.kind ==# 'docker'
