@@ -1670,6 +1670,185 @@ def RefreshRemoteTree()
   LoadTreeGit()
 enddef
 
+def CurrentRemoteTreeNode(): dict<any>
+  if &filetype !=# 'simpleremotetree'
+    return {}
+  endif
+  var nodes = get(b:, 'simpleremote_tree_nodes', [])
+  var index = line('.') - 1
+  return index >= 0 && index < len(nodes) ? get(nodes, index, {}) : {}
+enddef
+
+def CopyText(text: string): bool
+  if exists('*simpleclipboard#CopyText') == 1
+    try
+      return simpleclipboard#CopyText(text)
+    catch
+      Error('[SimpleRemote] SimpleClipboard failed: ' .. v:exception)
+    endtry
+  endif
+  setreg('"', text)
+  if has('clipboard')
+    try
+      setreg('+', text)
+      return true
+    catch
+    endtry
+  endif
+  return false
+enddef
+
+def YankRemoteTreeValue(absolute: bool)
+  var node = CurrentRemoteTreeNode()
+  if empty(node) || empty(get(node, 'path', ''))
+    return
+  endif
+  var value = absolute ? node.path : fnamemodify(node.path, ':t')
+  var copied = CopyText(value)
+  echomsg printf('[SimpleRemote] yanked %s%s', value,
+    copied ? '' : ' (unnamed register only)')
+enddef
+
+def OnRemoteContentRead(path: string, ok: bool, body: string)
+  if !ok
+    Error('[SimpleRemote] cannot copy file contents: ' .. body)
+    return
+  endif
+  var content = UnB64(body)
+  var configured = get(g:, 'simpleremote_clipboard_max_bytes', 1024 * 1024)
+  var limit = type(configured) == v:t_number && configured >= 0
+    ? configured : 1024 * 1024
+  if limit > 0 && strlen(content) > limit
+    Error(printf('[SimpleRemote] file is %d bytes; clipboard limit is %d',
+      strlen(content), limit))
+    return
+  endif
+  var copied = CopyText(content)
+  echomsg printf('[SimpleRemote] copied contents of %s%s', path,
+    copied ? '' : ' (unnamed register only)')
+enddef
+
+def CopyRemoteTreeContents()
+  var node = CurrentRemoteTreeNode()
+  if empty(node) || empty(get(node, 'path', ''))
+    return
+  endif
+  if get(node, 'type', '') ==# 'd'
+    Error('[SimpleRemote] directory contents cannot be copied to the text clipboard')
+    return
+  endif
+  Send('read', node.path,
+    (ok, body) => OnRemoteContentRead(node.path, ok, body))
+  echomsg '[SimpleRemote] reading ' .. node.path
+enddef
+
+def LocalCopyDirectory(): string
+  var configured = expand(get(g:, 'simpleremote_copy_destination', ''))
+  if !empty(configured) && isdirectory(configured)
+    return fnamemodify(configured, ':p')
+  endif
+  if exists('*simpletree#ExternalDropDirectory') == 1
+    try
+      var directory = simpletree#ExternalDropDirectory()
+      if !empty(directory) && isdirectory(directory)
+        return fnamemodify(directory, ':p')
+      endif
+    catch
+      Error('[SimpleRemote] SimpleTree destination failed: ' .. v:exception)
+    endtry
+  endif
+  return ''
+enddef
+
+def FinishCopyOut(remote_path: string, local_path: string,
+    errors: list<string>, status: number)
+  if status != 0
+    Error(printf('[SimpleRemote] copy failed (%d): %s', status,
+      empty(errors) ? remote_path : errors[-1]))
+    return
+  endif
+  var copied = CopyText(local_path)
+  echomsg printf('[SimpleRemote] copied %s -> %s%s', remote_path, local_path,
+    copied ? '' : ' (path in unnamed register)')
+  Emit('SimpleRemoteFileCopied', {
+    remote: remote_path,
+    local: local_path,
+  })
+  if exists(':SimpleTreeRefresh') == 2
+    silent! execute 'SimpleTreeRefresh'
+  endif
+enddef
+
+def CopyRemoteTreeFileOut()
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  var node = CurrentRemoteTreeNode()
+  if empty(node) || empty(get(node, 'path', ''))
+    return
+  endif
+  if get(node, 'type', '') ==# 'd'
+    Error('[SimpleRemote] recursive directory copy is not supported yet')
+    return
+  endif
+  var directory = LocalCopyDirectory()
+  var destination = empty(directory) ? ''
+    : substitute(directory, '[\\/]\+$', '', '') .. '/' .. fnamemodify(node.path, ':t')
+  if empty(destination) || get(g:, 'simpleremote_copy_prompt', 0)
+    destination = input('Copy remote file to: ',
+      empty(destination) ? expand('~/') .. fnamemodify(node.path, ':t') : destination,
+      'file')
+  endif
+  if empty(destination)
+    return
+  endif
+  destination = fnamemodify(destination, ':p')
+  var force = false
+  if filereadable(destination) || isdirectory(destination)
+    if isdirectory(destination)
+      Error('[SimpleRemote] destination is a directory: ' .. destination)
+      return
+    endif
+    force = confirm('Replace local file?\n' .. destination,
+      "&Replace\n&Cancel", 2) == 1
+    if !force
+      return
+    endif
+  endif
+  var daemon = DaemonPath()
+  var command: list<string>
+  if !empty(daemon)
+    command = [daemon, 'download', '--kind', s_remote.kind,
+      '--target', s_remote.target, '--root', s_remote.root,
+      '--remote', node.path, '--local', destination]
+    if force
+      add(command, '--force')
+    endif
+  elseif s_remote.kind ==# 'docker'
+    command = ['docker', 'cp', s_remote.target .. ':' .. node.path, destination]
+  else
+    command = ['scp', s_remote.target .. ':' .. node.path, destination]
+  endif
+  var errors: list<string> = []
+  var remote_path = node.path
+  var job = job_start(command, {
+    in_io: 'null', out_io: 'null', err_io: 'pipe', err_mode: 'nl',
+    err_cb: (_channel, line) => {
+      if !empty(line)
+        add(errors, line)
+      endif
+    },
+    exit_cb: (_job, status) =>
+      FinishCopyOut(remote_path, destination, errors, status),
+  })
+  if job_status(job) ==# 'fail'
+    Error('[SimpleRemote] cannot start file copy')
+    return
+  endif
+  echomsg printf('[SimpleRemote] copying %s -> %s', node.path, destination)
+enddef
+
 def OpenRemoteTree(path: string, reveal: string = '')
   if !IsReady()
     Error('[SimpleRemote] not connected')
@@ -1706,6 +1885,10 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> h <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <BS> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
+  nnoremap <silent><buffer> y <Cmd>call g:SimpleRemoteTreeYank(0)<CR>
+  nnoremap <silent><buffer> Y <Cmd>call g:SimpleRemoteTreeYank(1)<CR>
+  nnoremap <silent><buffer> gy <Cmd>call g:SimpleRemoteTreeCopyContents()<CR>
+  nnoremap <silent><buffer> c <Cmd>call g:SimpleRemoteTreeCopyOut()<CR>
   s_tree = {
     buf: buf,
     source_win: source_win,
@@ -1982,6 +2165,18 @@ enddef
 
 def g:SimpleRemoteTreeRefresh()
   RefreshRemoteTree()
+enddef
+
+def g:SimpleRemoteTreeYank(absolute: number)
+  YankRemoteTreeValue(absolute != 0)
+enddef
+
+def g:SimpleRemoteTreeCopyContents()
+  CopyRemoteTreeContents()
+enddef
+
+def g:SimpleRemoteTreeCopyOut()
+  CopyRemoteTreeFileOut()
 enddef
 
 def g:SimpleRemoteTreeClose()

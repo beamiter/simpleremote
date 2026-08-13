@@ -52,6 +52,15 @@ endif
 if !exists('g:simpleremote_use_daemon')
   g:simpleremote_use_daemon = 1
 endif
+if !exists('g:simpleremote_copy_destination')
+  g:simpleremote_copy_destination = ''
+endif
+if !exists('g:simpleremote_copy_prompt')
+  g:simpleremote_copy_prompt = 0
+endif
+if !exists('g:simpleremote_clipboard_max_bytes')
+  g:simpleremote_clipboard_max_bytes = 1024 * 1024
+endif
 
 const PLUGIN_ROOT = fnamemodify(expand('<sfile>:p'), ':h:h')
 if !exists('g:simpleremote_daemon_path')
@@ -78,6 +87,8 @@ command! -nargs=0 SimpleRemoteHealth call g:VimrcRemoteHealth()
 command! -nargs=0 SimpleRemoteReloadConfig call g:VimrcRemoteReloadConfig()
 command! -nargs=0 SimpleRemoteStatus call g:SimpleRemoteShowStatus()
 command! -nargs=0 SimpleRemoteProbe call g:SimpleRemoteProbe()
+command! -nargs=0 SimpleRemoteCopy call g:SimpleRemoteTreeCopyOut()
+command! -nargs=0 SimpleRemoteCopyContents call g:SimpleRemoteTreeCopyContents()
 
 nnoremap <silent> <Plug>(simpleremote-open) <Cmd>SimpleRemote<CR>
 nnoremap <silent> <Plug>(simpleremote-connect) <Cmd>SimpleRemoteConnect<CR>

@@ -9,6 +9,7 @@ defcompile
 assert_equal(1, exists('*g:SimpleRemoteConnect'))
 assert_equal(1, exists('*g:SimpleRemoteShellCommand'))
 assert_equal(1, exists('*g:SimpleRemoteProbe'))
+assert_equal(1, exists('*g:SimpleRemoteTreeCopyOut'))
 assert_equal(1, exists('*g:VimrcConfigureRemote'))
 if !empty(v:errors)
   writefile(v:errors, '/dev/stderr')

@@ -150,3 +150,29 @@ show the latest latency.
 
 Remote execution prepends project .venv, .conda, venv, and env directories,
 plus $HOME/.local/bin and $HOME/bin, without sourcing interactive shell files.
+
+TREE COPY INTEGRATION                          *simpleremote-tree-copy*
+
+In the virtual remote tree:
+
+  c     Download the selected file to SimpleTree's selected local directory.
+        Without a local SimpleTree root, prompt for the destination.
+  y     Copy the remote file name.
+  Y     Copy the absolute remote path.
+  gy    Copy the remote text file contents.
+
+The Rust "download" action streams bytes into a same-directory temporary file
+and atomically activates it.  It never loads the complete file into Vim.
+SimpleClipboard is used when available; fallback keeps text in the unnamed
+register.  A completed download emits SimpleRemoteFileCopied and refreshes
+SimpleTree.
+
+g:simpleremote_copy_destination        string  default: empty
+        Fixed local directory for c.  Empty asks SimpleTree for its selected
+        directory/root and prompts only when no local tree is available.
+
+g:simpleremote_copy_prompt              number  default: 0
+        Prompt for every c destination, prefilled with the integrated target.
+
+g:simpleremote_clipboard_max_bytes      number  default: 1048576
+        Maximum remote text size accepted by gy.  Zero disables the limit.

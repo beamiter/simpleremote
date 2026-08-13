@@ -1,11 +1,12 @@
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -15,6 +16,9 @@ struct RuntimeArgs {
     target: String,
     root: String,
     agent: String,
+    remote: String,
+    local: String,
+    force: bool,
     command: Vec<String>,
 }
 
@@ -35,12 +39,15 @@ fn run() -> Result<u8, String> {
         println!("simpleremote-daemon {VERSION}");
         return Ok(0);
     }
-    if action != "agent" && action != "exec" && action != "probe" {
-        return Err("usage: simpleremote-daemon {agent|exec|probe} [options]".to_string());
+    if action != "agent" && action != "exec" && action != "probe" && action != "download" {
+        return Err("usage: simpleremote-daemon {agent|exec|probe|download} [options]".to_string());
     }
 
     let parsed = parse_args(args.collect())?;
     validate(&parsed, &action)?;
+    if action == "download" {
+        return download(&parsed);
+    }
     let mut command = transport_command(&parsed, &action)?;
     if action == "probe" {
         let started = Instant::now();
@@ -77,6 +84,11 @@ fn parse_args(values: Vec<String>) -> Result<RuntimeArgs, String> {
             parsed.command = values[index + 1..].to_vec();
             break;
         }
+        if values[index] == "--force" {
+            parsed.force = true;
+            index += 1;
+            continue;
+        }
         let option = values[index].as_str();
         let value = values
             .get(index + 1)
@@ -87,6 +99,8 @@ fn parse_args(values: Vec<String>) -> Result<RuntimeArgs, String> {
             "--target" => parsed.target = value,
             "--root" => parsed.root = value,
             "--agent" => parsed.agent = value,
+            "--remote" => parsed.remote = value,
+            "--local" => parsed.local = value,
             _ => return Err(format!("unknown option: {option}")),
         }
         index += 2;
@@ -104,11 +118,26 @@ fn validate(args: &RuntimeArgs, action: &str) -> Result<(), String> {
     if action == "agent" && args.agent.is_empty() {
         return Err("--agent is required".to_string());
     }
-    if (action == "exec" || action == "probe") && !args.root.starts_with('/') {
+    if (action == "exec" || action == "probe" || action == "download")
+        && !args.root.starts_with('/')
+    {
         return Err("--root must be absolute".to_string());
     }
     if action == "exec" && args.command.is_empty() {
         return Err("a command is required after --".to_string());
+    }
+    if action == "download" {
+        let remote = Path::new(&args.remote);
+        let root = Path::new(&args.root);
+        if !remote.is_absolute()
+            || remote.components().any(|part| part == Component::ParentDir)
+            || !remote.starts_with(root)
+        {
+            return Err("--remote must be an absolute path inside --root".to_string());
+        }
+        if args.local.is_empty() {
+            return Err("--local is required".to_string());
+        }
     }
     Ok(())
 }
@@ -117,6 +146,7 @@ fn transport_command(args: &RuntimeArgs, action: &str) -> Result<Command, String
     let script = match action {
         "agent" => agent_script(&args.agent),
         "probe" => probe_script(&args.root),
+        "download" => download_script(&args.root, &args.remote),
         _ => exec_script(&args.root, &args.command),
     };
     if args.kind == "docker" {
@@ -180,6 +210,103 @@ fn probe_script(root: &str) -> String {
         "{}; python=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true); lsp=$(command -v pyright-langserver 2>/dev/null || command -v basedpyright-langserver 2>/dev/null || true); node=$(command -v node 2>/dev/null || true); git=$(command -v git 2>/dev/null || true); printf 'protocol=%s\\nhost=%s\\nroot=%s\\ngit=%s\\npython=%s\\npython_version=%s\\nnode=%s\\npython_lsp=%s\\n' 'simpleremote/runtime/1' \"$(hostname 2>/dev/null || true)\" \"$PWD\" \"$git\" \"$python\" \"$([ -n \"$python\" ] && \"$python\" --version 2>&1 | head -n 1 || true)\" \"$node\" \"$lsp\"",
         workspace_prelude(root)
     )
+}
+
+fn download_script(root: &str, remote: &str) -> String {
+    format!(
+        "{}; base=$(pwd -P) || exit 44; file=$(readlink -f -- {} 2>/dev/null) || {{ printf 'cannot resolve remote file: %s\\n' {} >&2; exit 45; }}; if [ \"$base\" != / ]; then case \"$file\" in \"$base\"/*) ;; *) printf 'remote file leaves workspace: %s\\n' \"$file\" >&2; exit 46;; esac; fi; [ -f \"$file\" ] || {{ printf 'not a regular file: %s\\n' \"$file\" >&2; exit 45; }}; exec cat -- \"$file\"",
+        workspace_prelude(root),
+        shell_quote(remote),
+        shell_quote(remote),
+    )
+}
+
+fn download(args: &RuntimeArgs) -> Result<u8, String> {
+    let destination = PathBuf::from(&args.local);
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or("--local must have a parent directory")?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "local destination directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    if destination.exists() && !args.force {
+        return Err(format!(
+            "local destination already exists: {} (pass --force to replace it)",
+            destination.display()
+        ));
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let temporary = parent.join(format!(
+        ".{name}.simpleremote-{}-{stamp}.part",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+
+    let mut command = transport_command(args, "download")?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start {} download: {error}", args.kind))?;
+    let mut stdout = child.stdout.take().ok_or("download has no stdout")?;
+    let mut stderr = child.stderr.take().ok_or("download has no stderr")?;
+    let errors = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let copied = match io::copy(&mut stdout, &mut file) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("download write failed: {error}"));
+        }
+    };
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for download: {error}"))?;
+    let error_bytes = errors.join().unwrap_or_default();
+    if !status.success() {
+        let _ = fs::remove_file(&temporary);
+        let detail = String::from_utf8_lossy(&error_bytes);
+        return Err(format!(
+            "remote download failed ({}): {}",
+            status.code().unwrap_or(1),
+            detail.trim()
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| format!("cannot sync {}: {error}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "cannot activate download {}: {error}",
+            destination.display()
+        )
+    })?;
+    println!("downloaded_bytes={copied}");
+    println!("local={}", destination.display());
+    Ok(0)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -275,5 +402,18 @@ mod tests {
             ..valid
         };
         assert!(validate(&invalid, "probe").is_err());
+    }
+
+    #[test]
+    fn download_rejects_paths_outside_the_workspace() {
+        let args = RuntimeArgs {
+            kind: "ssh".into(),
+            target: "host".into(),
+            root: "/workspace".into(),
+            remote: "/workspace/../secret".into(),
+            local: "/tmp/file".into(),
+            ..RuntimeArgs::default()
+        };
+        assert!(validate(&args, "download").is_err());
     }
 }

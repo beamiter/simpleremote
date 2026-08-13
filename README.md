@@ -40,3 +40,20 @@ Remote commands automatically prepend project `.venv`, `.conda`, `venv`, and
 `env` tool directories plus `$HOME/.local/bin` and `$HOME/bin`. This makes uv,
 project Python environments, and user-installed language servers available to
 non-login SSH sessions without sourcing interactive shell files into LSP stdio.
+
+## SimpleTree and SimpleClipboard copy workflow
+
+The virtual remote tree follows the SimpleTree copy vocabulary:
+
+- `c` streams the selected remote file through the Rust runtime into
+  `simpletree#ExternalDropDirectory()` (or prompts when no local tree exists).
+  The write is staged beside the destination and atomically activated.
+- `y` copies the file name and `Y` copies the absolute remote path.
+- `gy` copies remote text file contents, subject to
+  `g:simpleremote_clipboard_max_bytes` (1 MiB by default).
+
+All text and resulting local paths use `simpleclipboard#CopyText()` when
+available. Successful downloads emit `User SimpleRemoteFileCopied` with
+`g:simpleremote_event.remote` and `.local`, then refresh SimpleTree.
+Set `g:simpleremote_copy_destination` for a fixed local drop directory or
+`g:simpleremote_copy_prompt = 1` to confirm every destination.
