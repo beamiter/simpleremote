@@ -1312,8 +1312,10 @@ def ParseTreeDirectory(path: string, body: string): list<dict<any>>
       add(files, node)
     endif
   endfor
-  sort(directories, (a, b) => stricmp(a.name, b.name))
-  sort(files, (a, b) => stricmp(a.name, b.name))
+  sort(directories, (a, b) =>
+    a.name ==? b.name ? 0 : a.name <? b.name ? -1 : 1)
+  sort(files, (a, b) =>
+    a.name ==? b.name ? 0 : a.name <? b.name ? -1 : 1)
   return directories + files
 enddef
 
