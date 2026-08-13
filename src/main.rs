@@ -1,10 +1,11 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
+use std::time::Instant;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -34,13 +35,30 @@ fn run() -> Result<u8, String> {
         println!("simpleremote-daemon {VERSION}");
         return Ok(0);
     }
-    if action != "agent" && action != "exec" {
-        return Err("usage: simpleremote-daemon {agent|exec} [options]".to_string());
+    if action != "agent" && action != "exec" && action != "probe" {
+        return Err("usage: simpleremote-daemon {agent|exec|probe} [options]".to_string());
     }
 
     let parsed = parse_args(args.collect())?;
     validate(&parsed, &action)?;
     let mut command = transport_command(&parsed, &action)?;
+    if action == "probe" {
+        let started = Instant::now();
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("cannot probe {} transport: {error}", parsed.kind))?;
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(&output.stdout)
+            .map_err(|error| format!("cannot write probe output: {error}"))?;
+        writeln!(stdout, "runtime_ms={}", started.elapsed().as_millis())
+            .map_err(|error| format!("cannot write probe latency: {error}"))?;
+        io::stderr()
+            .write_all(&output.stderr)
+            .map_err(|error| format!("cannot write probe error: {error}"))?;
+        return Ok(output.status.code().unwrap_or(1).clamp(0, 255) as u8);
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -86,22 +104,20 @@ fn validate(args: &RuntimeArgs, action: &str) -> Result<(), String> {
     if action == "agent" && args.agent.is_empty() {
         return Err("--agent is required".to_string());
     }
-    if action == "exec" {
-        if !args.root.starts_with('/') {
-            return Err("--root must be absolute".to_string());
-        }
-        if args.command.is_empty() {
-            return Err("a command is required after --".to_string());
-        }
+    if (action == "exec" || action == "probe") && !args.root.starts_with('/') {
+        return Err("--root must be absolute".to_string());
+    }
+    if action == "exec" && args.command.is_empty() {
+        return Err("a command is required after --".to_string());
     }
     Ok(())
 }
 
 fn transport_command(args: &RuntimeArgs, action: &str) -> Result<Command, String> {
-    let script = if action == "agent" {
-        agent_script(&args.agent)
-    } else {
-        exec_script(&args.root, &args.command)
+    let script = match action {
+        "agent" => agent_script(&args.agent),
+        "probe" => probe_script(&args.root),
+        _ => exec_script(&args.root, &args.command),
     };
     if args.kind == "docker" {
         let mut command = Command::new("docker");
@@ -111,6 +127,8 @@ fn transport_command(args: &RuntimeArgs, action: &str) -> Result<Command, String
 
     let control_path = control_path(&args.target)?;
     let persist = env::var("SIMPLEREMOTE_CONTROL_PERSIST").unwrap_or_else(|_| "600".to_string());
+    let connect_timeout =
+        env::var("SIMPLEREMOTE_CONNECT_TIMEOUT").unwrap_or_else(|_| "10".to_string());
     let mut command = Command::new("ssh");
     command
         .arg("-T")
@@ -120,6 +138,14 @@ fn transport_command(args: &RuntimeArgs, action: &str) -> Result<Command, String
         .arg(format!("ControlPersist={persist}"))
         .arg("-o")
         .arg(format!("ControlPath={}", control_path.display()))
+        .arg("-o")
+        .arg(format!("ConnectTimeout={connect_timeout}"))
+        .arg("-o")
+        .arg("ConnectionAttempts=1")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
         .arg(&args.target)
         .args(["sh", "-c", &shell_quote(&script)]);
     Ok(command)
@@ -139,9 +165,20 @@ fn exec_script(root: &str, command: &[String]) -> String {
         .map(|value| shell_quote(value))
         .collect::<Vec<_>>()
         .join(" ");
+    format!("{}; exec {server}", workspace_prelude(root))
+}
+
+fn workspace_prelude(root: &str) -> String {
     format!(
-        "cd {} && if [ -d .venv/bin ]; then PATH=\"$PWD/.venv/bin:$PATH\"; export PATH; fi; exec {server}",
+        "cd {} || exit 44; for d in \"$HOME/bin\" \"$HOME/.local/bin\" \"$PWD/env/bin\" \"$PWD/venv/bin\" \"$PWD/.conda/bin\" \"$PWD/.venv/bin\"; do [ -d \"$d\" ] && PATH=\"$d:$PATH\"; done; export PATH",
         shell_quote(root)
+    )
+}
+
+fn probe_script(root: &str) -> String {
+    format!(
+        "{}; python=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true); lsp=$(command -v pyright-langserver 2>/dev/null || command -v basedpyright-langserver 2>/dev/null || true); node=$(command -v node 2>/dev/null || true); git=$(command -v git 2>/dev/null || true); printf 'protocol=%s\\nhost=%s\\nroot=%s\\ngit=%s\\npython=%s\\npython_version=%s\\nnode=%s\\npython_lsp=%s\\n' 'simpleremote/runtime/1' \"$(hostname 2>/dev/null || true)\" \"$PWD\" \"$git\" \"$python\" \"$([ -n \"$python\" ] && \"$python\" --version 2>&1 | head -n 1 || true)\" \"$node\" \"$lsp\"",
+        workspace_prelude(root)
     )
 }
 
@@ -209,4 +246,34 @@ fn proxy(mut child: Child) -> Result<u8, String> {
     let _ = output.join();
     let _ = errors.join();
     Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_uses_project_and_user_environment_paths() {
+        let script = exec_script("/tmp/project with space", &["python3".into(), "-V".into()]);
+        assert!(script.contains("$PWD/.venv/bin"));
+        assert!(script.contains("$HOME/.local/bin"));
+        assert!(script.contains("cd '/tmp/project with space'"));
+        assert!(script.ends_with("exec 'python3' '-V'"));
+    }
+
+    #[test]
+    fn probe_requires_an_absolute_root_but_no_command() {
+        let valid = RuntimeArgs {
+            kind: "ssh".into(),
+            target: "host".into(),
+            root: "/workspace".into(),
+            ..RuntimeArgs::default()
+        };
+        assert!(validate(&valid, "probe").is_ok());
+        let invalid = RuntimeArgs {
+            root: "relative".into(),
+            ..valid
+        };
+        assert!(validate(&invalid, "probe").is_err());
+    }
 }

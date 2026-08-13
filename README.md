@@ -27,3 +27,16 @@ Set `g:simpleremote_use_daemon = 0` to disable the runtime, or set
 
 See `:help simpleremote` for commands, profiles, workspace projection, and the
 integration API.
+
+## Runtime probe and remote environment
+
+`simpleremote-daemon probe` reuses the SSH ControlMaster connection to report
+the remote host, project root, Git, Python, Node, Python LSP, and round-trip
+latency. SimpleRemote runs it asynchronously after connection, publishes it as
+the `probe` member of `g:simpleremote_workspace`, and shows it through
+`:SimpleRemoteStatus`. Use `:SimpleRemoteProbe` to refresh the snapshot.
+
+Remote commands automatically prepend project `.venv`, `.conda`, `venv`, and
+`env` tool directories plus `$HOME/.local/bin` and `$HOME/bin`. This makes uv,
+project Python environments, and user-installed language servers available to
+non-login SSH sessions without sourcing interactive shell files into LSP stdio.

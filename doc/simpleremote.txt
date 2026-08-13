@@ -137,3 +137,16 @@ LSP stdio transport, while older SimpleRemote or SimpleCC versions continue to
 fall back to direct SSH/Docker commands.
 
 vim:tw=78:ts=8:noet:ft=help:norl:
+
+RUNTIME PROBE                                      *simpleremote-runtime-probe*
+
+After connection the Rust runtime performs a non-blocking environment probe.
+Its "probe" workspace member includes the remote host, project root, Git,
+Python, Node, Python LSP, and runtime latency.  The tree and global statusline
+show the latest latency.
+
+*:SimpleRemoteProbe*
+        Refresh the Rust runtime environment and latency snapshot.
+
+Remote execution prepends project .venv, .conda, venv, and env directories,
+plus $HOME/.local/bin and $HOME/bin, without sourcing interactive shell files.

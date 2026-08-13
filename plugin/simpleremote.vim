@@ -77,6 +77,7 @@ command! -nargs=0 SimpleRemoteInstallAgent call g:SimpleRemoteInstallAgent()
 command! -nargs=0 SimpleRemoteHealth call g:VimrcRemoteHealth()
 command! -nargs=0 SimpleRemoteReloadConfig call g:VimrcRemoteReloadConfig()
 command! -nargs=0 SimpleRemoteStatus call g:SimpleRemoteShowStatus()
+command! -nargs=0 SimpleRemoteProbe call g:SimpleRemoteProbe()
 
 nnoremap <silent> <Plug>(simpleremote-open) <Cmd>SimpleRemote<CR>
 nnoremap <silent> <Plug>(simpleremote-connect) <Cmd>SimpleRemoteConnect<CR>

@@ -196,6 +196,56 @@ def DaemonPath(): string
   return executable(path) ? path : ''
 enddef
 
+def OnRuntimeProbeLine(generation: number, _channel: any, line: string)
+  if IsCurrent(generation) && !empty(line)
+    add(s_remote.runtime_probe_lines, line)
+  endif
+enddef
+
+def OnRuntimeProbeError(generation: number, _channel: any, line: string)
+  if IsCurrent(generation) && !empty(line)
+    s_remote.runtime_probe_error = line
+  endif
+enddef
+
+def OnRuntimeProbeExit(generation: number, _job: any, status: number)
+  if !IsCurrent(generation)
+    return
+  endif
+  var probe: dict<any> = {status: status}
+  for line in get(s_remote, 'runtime_probe_lines', [])
+    var separator = stridx(line, '=')
+    if separator > 0
+      probe[strpart(line, 0, separator)] = strpart(line, separator + 1)
+    endif
+  endfor
+  if !empty(get(s_remote, 'runtime_probe_error', ''))
+    probe.error = s_remote.runtime_probe_error
+  endif
+  s_remote.runtime_probe = probe
+  g:simpleremote_workspace = WorkspaceSnapshot()
+  Emit('SimpleRemoteRuntimeReady', copy(g:simpleremote_workspace))
+enddef
+
+def StartRuntimeProbe(generation: number)
+  var daemon = DaemonPath()
+  if empty(daemon) || !IsCurrent(generation)
+    return
+  endif
+  s_remote.runtime_probe_lines = []
+  s_remote.runtime_probe_error = ''
+  s_remote.runtime_probe = {status: -1}
+  s_remote.probe_job = job_start([
+    daemon, 'probe', '--kind', s_remote.kind, '--target', s_remote.target,
+    '--root', s_remote.root,
+  ], {
+    in_io: 'null', out_io: 'pipe', err_io: 'pipe', out_mode: 'nl', err_mode: 'nl',
+    out_cb: (channel, line) => OnRuntimeProbeLine(generation, channel, line),
+    err_cb: (channel, line) => OnRuntimeProbeError(generation, channel, line),
+    exit_cb: (job, status) => OnRuntimeProbeExit(generation, job, status),
+  })
+enddef
+
 def ShellLiteral(value: string): string
   return shellescape(value)
 enddef
@@ -266,6 +316,7 @@ def FinishConnection(generation: number)
   echomsg printf('[SimpleRemote] connected %s %s:%s',
     s_remote.kind, s_remote.target, s_remote.root)
   Emit('SimpleRemoteConnected', WorkspaceSnapshot())
+  StartRuntimeProbe(generation)
 
   var queued = copy(s_remote.open_queue)
   s_remote.open_queue = []
@@ -760,6 +811,7 @@ def WorkspaceSnapshot(): dict<any>
     local_root: get(s_remote, 'local_root', ''),
     mode: get(s_remote, 'workspace_mode', 'virtual'),
     runtime: DaemonPath(),
+    probe: get(s_remote, 'runtime_probe', {}),
     uri: 'remote://' .. get(s_remote, 'root', ''),
   }
 enddef
@@ -1874,9 +1926,26 @@ def g:SimpleRemoteShowStatus()
     return
   endif
   var workspace = WorkspaceSnapshot()
-  echomsg printf('[SimpleRemote] %s %s:%s [%s]%s',
+  var probe = get(workspace, 'probe', {})
+  var latency = get(probe, 'runtime_ms', '')
+  echomsg printf('[SimpleRemote] %s %s:%s [%s]%s%s',
     workspace.kind, workspace.target, workspace.root, workspace.mode,
-    empty(workspace.local_root) ? '' : ' -> ' .. workspace.local_root)
+    empty(workspace.local_root) ? '' : ' -> ' .. workspace.local_root,
+    empty(latency) ? '' : '  ' .. latency .. 'ms')
+  if !empty(probe)
+    echomsg printf('[SimpleRemote] host=%s python=%s lsp=%s',
+      get(probe, 'host', '?'), get(probe, 'python', 'missing'),
+      get(probe, 'python_lsp', 'missing'))
+  endif
+enddef
+
+def g:SimpleRemoteProbe()
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  StartRuntimeProbe(s_remote.generation)
+  echomsg '[SimpleRemote] runtime probe started'
 enddef
 
 def g:SimpleRemoteTreeToggle()
@@ -1920,8 +1989,10 @@ def g:SimpleRemoteTreeClose()
 enddef
 
 def g:SimpleRemoteTreeStatusline(): string
-  return empty(s_remote) ? ' SimpleRemote ' : printf(' %s:%s  %s ',
+  var latency = get(get(s_remote, 'runtime_probe', {}), 'runtime_ms', '')
+  return empty(s_remote) ? ' SimpleRemote ' : printf(' %s:%s%s  %s ',
     s_remote.kind, s_remote.target,
+    empty(latency) ? '' : '@' .. latency .. 'ms',
     get(b:, 'simpleremote_tree_path', s_remote.root))
 enddef
 
@@ -2069,8 +2140,10 @@ def g:SimpleRemoteShellCommand(command: string): list<string>
 enddef
 
 def g:SimpleRemoteStatusline(): string
-  return empty(s_remote) ? '' : printf('%s:%s:%s',
-    s_remote.kind, s_remote.target, fnamemodify(s_remote.root, ':t'))
+  var latency = get(get(s_remote, 'runtime_probe', {}), 'runtime_ms', '')
+  return empty(s_remote) ? '' : printf('%s:%s:%s%s',
+    s_remote.kind, s_remote.target, fnamemodify(s_remote.root, ':t'),
+    empty(latency) ? '' : '@' .. latency .. 'ms')
 enddef
 
 def g:SimpleRemoteComplete(arglead: string, _cmdline: string,
