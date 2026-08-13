@@ -848,6 +848,14 @@ def ProjectionStateDir(): string
   return get(g:, 'simpleremote_state_dir', state .. '/simpleremote')
 enddef
 
+def EnsurePrivateDir(path: string): bool
+  if mkdir(path, 'p', 0o700) == 0 && !isdirectory(path)
+    return false
+  endif
+  setfperm(path, 'rwx------')
+  return isdirectory(path)
+enddef
+
 def ActivateProjection(local_root: string, mode: string, owned: bool = false)
   if empty(s_remote) || !isdirectory(local_root)
     return
@@ -900,7 +908,7 @@ def StartSshfs(generation: number): bool
   var key = substitute(s_remote.target, '[^0-9A-Za-z_.-]', '_', 'g')
     .. '-' .. strpart(sha256(s_remote.root), 0, 12)
   var mountpoint = ProjectionStateDir() .. '/mounts/' .. key
-  if mkdir(mountpoint, 'p', 0700) == 0 && !isdirectory(mountpoint)
+  if !EnsurePrivateDir(ProjectionStateDir()) || !EnsurePrivateDir(mountpoint)
     return false
   endif
   if executable('mountpoint')
@@ -978,6 +986,7 @@ def DeactivateWorkspace(remote: dict<any>)
 enddef
 
 def HistoryFile(): string
+  EnsurePrivateDir(ProjectionStateDir())
   return get(g:, 'simpleremote_history_file',
     ProjectionStateDir() .. '/recent.json')
 enddef
@@ -1022,7 +1031,7 @@ def RecordRecent()
     endif
   endfor
   try
-    mkdir(fnamemodify(HistoryFile(), ':h'), 'p', 0700)
+    mkdir(fnamemodify(HistoryFile(), ':h'), 'p', 0o700)
     writefile([json_encode(recent)], HistoryFile())
   catch
     # History is convenience state and must never break a live connection.
