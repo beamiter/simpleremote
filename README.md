@@ -57,3 +57,10 @@ available. Successful downloads emit `User SimpleRemoteFileCopied` with
 `g:simpleremote_event.remote` and `.local`, then refresh SimpleTree.
 Set `g:simpleremote_copy_destination` for a fixed local drop directory or
 `g:simpleremote_copy_prompt = 1` to confirm every destination.
+
+The remote tree also shares SimpleTree's root-navigation vocabulary without
+changing the connected workspace or restarting SimpleCC: `e` uses the selected
+directory, `U` moves to its parent, `C` prompts for a remote directory, and `.`
+returns to the workspace root. Roots are constrained to the connected
+workspace. Mounted SimpleTree roots synchronize through `SimpleTreeRootChanged`
+and `simpletree#ExternalSetRoot()`.

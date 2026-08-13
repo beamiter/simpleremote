@@ -309,6 +309,7 @@ def FinishConnection(generation: number)
     return
   endif
   s_remote.state = 'ready'
+  s_remote.tree_root = s_remote.root
   s_remote.connection_announced = true
   SetStatus(printf('%s:%s', s_remote.kind, s_remote.target))
   var mounting = ActivateWorkspace(generation)
@@ -808,6 +809,7 @@ def WorkspaceSnapshot(): dict<any>
     kind: get(s_remote, 'kind', ''),
     target: get(s_remote, 'target', ''),
     root: get(s_remote, 'root', ''),
+    tree_root: get(s_remote, 'tree_root', get(s_remote, 'root', '')),
     local_root: get(s_remote, 'local_root', ''),
     mode: get(s_remote, 'workspace_mode', 'virtual'),
     runtime: DaemonPath(),
@@ -1655,6 +1657,93 @@ def LoadRemoteTree(path: string)
   LoadTreeGit()
 enddef
 
+def NormalizeTreeRoot(path: string): string
+  if empty(path) || path !~# '^/'
+    return ''
+  endif
+  var normalized = substitute(simplify(path), '/\+$', '', '')
+  return empty(normalized) ? '/' : normalized
+enddef
+
+def SimpleTreeVisible(): bool
+  for window in getwininfo()
+    if getbufvar(window.bufnr, '&filetype') ==# 'simpletree'
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def RemoteTreeLocalPath(remote_path: string): string
+  var base = substitute(get(s_remote, 'local_root', ''), '[\\/]\+$', '', '')
+  var suffix = strpart(remote_path, len(s_remote.root))
+  return s_remote.root ==# '/'
+    ? base .. '/' .. substitute(suffix, '^/', '', '')
+    : base .. suffix
+enddef
+
+def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return false
+  endif
+  var target = NormalizeTreeRoot(path)
+  if empty(target) || !UnderRoot(target, s_remote.root)
+    Error('[SimpleRemote] tree root must stay inside workspace: ' .. s_remote.root)
+    return false
+  endif
+  s_remote.tree_root = target
+  g:simpleremote_workspace = WorkspaceSnapshot()
+  Emit('SimpleRemoteTreeRootChanged', {
+    root: target,
+    workspace: s_remote.root,
+    mode: get(s_remote, 'workspace_mode', 'virtual'),
+  })
+  var local_root = get(s_remote, 'local_root', '')
+  if sync_view && !empty(local_root) && SimpleTreeVisible()
+        && exists('*simpletree#ExternalSetRoot') == 1
+    var local_target = RemoteTreeLocalPath(target)
+    if !simpletree#ExternalSetRoot(local_target)
+      Error('[SimpleRemote] local tree root is unavailable: ' .. local_target)
+      return false
+    endif
+  elseif !empty(s_tree)
+    LoadRemoteTree(target)
+  endif
+  return true
+enddef
+
+def RemoteTreeRootHere()
+  var node = CurrentRemoteTreeNode()
+  if empty(node)
+    return
+  endif
+  var target = get(node, 'type', '') ==# 'd'
+    ? node.path : RemoteParent(node.path)
+  SetRemoteTreeRoot(target)
+enddef
+
+def RemoteTreeRootUp()
+  var current = get(s_tree, 'root', get(s_remote, 'tree_root', s_remote.root))
+  if current ==# s_remote.root
+    echomsg '[SimpleRemote] already at workspace root'
+    return
+  endif
+  SetRemoteTreeRoot(RemoteParent(current))
+enddef
+
+def RemoteTreeRootPrompt()
+  var current = get(s_tree, 'root', get(s_remote, 'tree_root', s_remote.root))
+  var target = input('Remote tree root: ', current)
+  if !empty(target)
+    SetRemoteTreeRoot(target)
+  endif
+enddef
+
+def RemoteTreeRootReset()
+  SetRemoteTreeRoot(s_remote.root)
+enddef
+
 def RefreshRemoteTree()
   if empty(s_tree)
     return
@@ -1885,6 +1974,10 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> h <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <BS> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
+  nnoremap <silent><buffer> e <Cmd>call g:SimpleRemoteTreeRootHere()<CR>
+  nnoremap <silent><buffer> U <Cmd>call g:SimpleRemoteTreeRootUp()<CR>
+  nnoremap <silent><buffer> C <Cmd>call g:SimpleRemoteTreeRootPrompt()<CR>
+  nnoremap <silent><buffer> . <Cmd>call g:SimpleRemoteTreeRootReset()<CR>
   nnoremap <silent><buffer> y <Cmd>call g:SimpleRemoteTreeYank(0)<CR>
   nnoremap <silent><buffer> Y <Cmd>call g:SimpleRemoteTreeYank(1)<CR>
   nnoremap <silent><buffer> gy <Cmd>call g:SimpleRemoteTreeCopyContents()<CR>
@@ -1915,15 +2008,21 @@ def OpenWorkspaceTree()
   endif
   var local_root = get(s_remote, 'local_root', '')
   if !empty(local_root)
+    var remote_tree_root = get(s_remote, 'tree_root', s_remote.root)
+    var local_tree_root = RemoteTreeLocalPath(remote_tree_root)
     CloseRemoteTree()
     if exists(':SimpleTree') == 2
-      execute 'SimpleTree ' .. fnameescape(local_root)
+      if SimpleTreeVisible() && exists('*simpletree#ExternalSetRoot') == 1
+            && simpletree#ExternalSetRoot(local_tree_root)
+        return
+      endif
+      execute 'SimpleTree ' .. fnameescape(local_tree_root)
     elseif exists(':Explore') == 2
-      execute 'Explore ' .. fnameescape(local_root)
+      execute 'Explore ' .. fnameescape(local_tree_root)
     endif
     return
   endif
-  OpenRemoteTree(s_remote.root)
+  OpenRemoteTree(get(s_remote, 'tree_root', s_remote.root))
 enddef
 
 def RemoteTreeActivate(action: string)
@@ -2165,6 +2264,41 @@ enddef
 
 def g:SimpleRemoteTreeRefresh()
   RefreshRemoteTree()
+enddef
+
+def g:SimpleRemoteTreeRootHere()
+  RemoteTreeRootHere()
+enddef
+
+def g:SimpleRemoteTreeRootUp()
+  RemoteTreeRootUp()
+enddef
+
+def g:SimpleRemoteTreeRootPrompt()
+  RemoteTreeRootPrompt()
+enddef
+
+def g:SimpleRemoteTreeRootReset()
+  RemoteTreeRootReset()
+enddef
+
+def g:SimpleRemoteTreeSetRoot(path: string): bool
+  return SetRemoteTreeRoot(path)
+enddef
+
+def g:SimpleRemoteOnSimpleTreeRootChanged()
+  if !IsReady() || empty(get(s_remote, 'local_root', ''))
+    return
+  endif
+  var event = get(g:, 'simpletree_event', {})
+  var local = type(event) == v:t_dict ? get(event, 'path', '') : ''
+  if empty(local) || !UnderRoot(local, s_remote.local_root)
+    return
+  endif
+  var suffix = strpart(local, len(s_remote.local_root))
+  var remote = s_remote.root ==# '/'
+    ? '/' .. substitute(suffix, '^/', '', '') : s_remote.root .. suffix
+  SetRemoteTreeRoot(remote, false)
 enddef
 
 def g:SimpleRemoteTreeYank(absolute: number)

@@ -89,6 +89,7 @@ command! -nargs=0 SimpleRemoteStatus call g:SimpleRemoteShowStatus()
 command! -nargs=0 SimpleRemoteProbe call g:SimpleRemoteProbe()
 command! -nargs=0 SimpleRemoteCopy call g:SimpleRemoteTreeCopyOut()
 command! -nargs=0 SimpleRemoteCopyContents call g:SimpleRemoteTreeCopyContents()
+command! -nargs=1 SimpleRemoteTreeRoot call g:SimpleRemoteTreeSetRoot(<q-args>)
 
 nnoremap <silent> <Plug>(simpleremote-open) <Cmd>SimpleRemote<CR>
 nnoremap <silent> <Plug>(simpleremote-connect) <Cmd>SimpleRemoteConnect<CR>
@@ -96,3 +97,8 @@ nnoremap <silent> <Plug>(simpleremote-disconnect) <Cmd>SimpleRemoteDisconnect<CR
 nnoremap <silent> <Plug>(simpleremote-reconnect) <Cmd>SimpleRemoteReconnect<CR>
 nnoremap <silent> <Plug>(simpleremote-tree-toggle) <Cmd>SimpleRemoteTree<CR>
 nnoremap <silent> <Plug>(simpleremote-status) <Cmd>SimpleRemoteStatus<CR>
+
+augroup SimpleRemoteTreeIntegration
+  autocmd!
+  autocmd User SimpleTreeRootChanged call g:SimpleRemoteOnSimpleTreeRootChanged()
+augroup END
