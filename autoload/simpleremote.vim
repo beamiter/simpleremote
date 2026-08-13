@@ -1757,14 +1757,35 @@ def RemoteTreeRootReset()
   SetRemoteTreeRoot(s_remote.root)
 enddef
 
-def RemoteTreeHelpFilter(id: number, key: string): bool
-  if key ==# '?' || key ==# 'q' || key ==# "\<Esc>"
-    popup_close(id)
+var s_tree_help_popup: number = 0
+
+def RemoteTreeHelpClosed(id: number, _result: number)
+  if s_tree_help_popup == id
+    s_tree_help_popup = 0
   endif
-  return true
+enddef
+
+def RemoteTreeHelpFilter(id: number, key: string): number
+  if key ==# '?' || key ==# 'q' || key ==# "\<Esc>"
+    try
+      popup_close(id)
+    catch
+    endtry
+    s_tree_help_popup = 0
+    return 1
+  endif
+  return 1
 enddef
 
 def RemoteTreeHelp()
+  if s_tree_help_popup != 0 && exists('*popup_close') == 1
+    try
+      popup_close(s_tree_help_popup)
+    catch
+    endtry
+    s_tree_help_popup = 0
+    return
+  endif
   var lines = [
     'NAVIGATE',
     '  <CR> / o / l / Right   open or expand',
@@ -1790,11 +1811,11 @@ def RemoteTreeHelp()
     '  z            collapse all directories',
     '  /            find a visible node',
     '  ]f / [f      next / previous find match',
-    '  q / <Esc>    close tree',
+    '  q / <Esc>    close this help',
     '  ?            show or close this help',
   ]
   if exists('*popup_create') == 1
-    popup_create(lines, {
+    s_tree_help_popup = popup_create(lines, {
       title: ' SimpleRemote tree keys ',
       pos: 'center',
       padding: [0, 1, 0, 1],
@@ -1803,7 +1824,9 @@ def RemoteTreeHelp()
       minwidth: min([62, &columns - 4]),
       maxheight: max([8, &lines - 4]),
       close: 'click',
+      mapping: 0,
       filter: RemoteTreeHelpFilter,
+      callback: RemoteTreeHelpClosed,
       zindex: 300,
     })
     return
