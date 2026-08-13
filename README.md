@@ -65,3 +65,11 @@ directory, and `.` returns to the workspace root. The connection and LSP keep
 their original project root while the tree browses elsewhere. When an SSHFS or
 bind mount covers only the workspace, browsing outside it automatically uses
 the virtual remote tree and returning inside restores the local SimpleTree.
+Press `?` in the virtual remote tree for a complete key reference; the
+statusline keeps a visible `[? keys]` hint.
+
+The virtual tree mirrors SimpleTree's navigation surface: `o`, arrow keys,
+`S/V/t`, Ctrl split keys, `P` preview, `H` hidden files, `z` collapse all,
+`f` reveal active file, `/` find, and `]f`/`[f` match cycling. Existing
+lowercase split aliases remain available for compatibility. The statusline
+shows find, hidden-file, and detached-root state.

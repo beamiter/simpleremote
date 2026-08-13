@@ -1757,6 +1757,141 @@ def RemoteTreeRootReset()
   SetRemoteTreeRoot(s_remote.root)
 enddef
 
+def RemoteTreeHelpFilter(id: number, key: string): bool
+  if key ==# '?' || key ==# 'q' || key ==# "\<Esc>"
+    popup_close(id)
+  endif
+  return true
+enddef
+
+def RemoteTreeHelp()
+  var lines = [
+    'NAVIGATE',
+    '  <CR> / o / l / Right   open or expand',
+    '  h / Left / <BS>        collapse / parent node',
+    '  S / V / t              split / vsplit / tab',
+    '  P                      preview file',
+    '  f                      reveal active remote file',
+    '',
+    'TREE ROOT',
+    '  e            selected directory becomes tree root',
+    '  U            tree root goes up (up to remote /)',
+    '  C            enter any absolute remote tree root',
+    '  .            restore connected workspace root',
+    '',
+    'COPY',
+    '  c            download file into local SimpleTree',
+    '  gy           copy remote file contents',
+    '  y / Y        copy file name / absolute remote path',
+    '',
+    'GENERAL',
+    '  R / r        refresh tree',
+    '  H            toggle hidden files',
+    '  z            collapse all directories',
+    '  /            find a visible node',
+    '  ]f / [f      next / previous find match',
+    '  q / <Esc>    close tree',
+    '  ?            show or close this help',
+  ]
+  if exists('*popup_create') == 1
+    popup_create(lines, {
+      title: ' SimpleRemote tree keys ',
+      pos: 'center',
+      padding: [0, 1, 0, 1],
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+      minwidth: min([62, &columns - 4]),
+      maxheight: max([8, &lines - 4]),
+      close: 'click',
+      filter: RemoteTreeHelpFilter,
+      zindex: 300,
+    })
+    return
+  endif
+  for line in lines
+    echomsg line
+  endfor
+enddef
+
+def RemoteTreeToggleHidden()
+  g:simpleremote_tree_show_hidden = get(g:, 'simpleremote_tree_show_hidden', 1)
+    ? 0 : 1
+  RefreshRemoteTree()
+  echomsg '[SimpleRemote] hidden files: '
+    .. (g:simpleremote_tree_show_hidden ? 'shown' : 'hidden')
+enddef
+
+def RemoteTreeCollapseAll()
+  if empty(s_tree)
+    return
+  endif
+  s_tree.expanded = {s_tree.root: true}
+  s_tree.reveal = s_tree.root
+  RenderRemoteTree(s_tree.buf)
+  echomsg '[SimpleRemote] collapsed all directories'
+enddef
+
+def RemoteTreeFind(ask: bool, direction: number = 1)
+  if empty(s_tree) || !bufexists(get(s_tree, 'buf', -1))
+    return
+  endif
+  var query = get(s_tree, 'find_query', '')
+  if ask
+    query = input('Find remote node: ', query)
+    if empty(query)
+      return
+    endif
+    s_tree.find_query = query
+  elseif empty(query)
+    echomsg '[SimpleRemote] no active tree find; press / first'
+    return
+  endif
+  var nodes = getbufvar(s_tree.buf, 'simpleremote_tree_nodes', [])
+  if empty(nodes)
+    return
+  endif
+  var current = bufwinid(s_tree.buf) > 0
+    ? getcurpos(bufwinid(s_tree.buf))[1] - 1 : 0
+  var needle = tolower(query)
+  var total = len(nodes)
+  for step in range(1, total)
+    var index = (current + direction * step + total * 2) % total
+    var node = get(nodes, index, {})
+    var path = get(node, 'path', '')
+    if !empty(path) && (stridx(tolower(fnamemodify(path, ':t')), needle) >= 0
+          || stridx(tolower(path), needle) >= 0)
+      var winid = bufwinid(s_tree.buf)
+      if winid > 0
+        win_execute(winid, printf('cursor(%d, 1)', index + 1))
+      endif
+      return
+    endif
+  endfor
+  echomsg '[SimpleRemote] no visible match: ' .. query
+enddef
+
+def RemoteTreeRevealActive()
+  var source = get(s_tree, 'source_win', 0)
+  var windows = source > 0 ? getwininfo(source) : []
+  if empty(windows)
+    echomsg '[SimpleRemote] no active remote file window'
+    return
+  endif
+  var buffer = windows[0].bufnr
+  var info = getbufvar(buffer, 'vimrc_remote', {})
+  var path = type(info) == v:t_dict ? get(info, 'path', '') : ''
+  if empty(path)
+    path = getbufvar(buffer, 'simpleremote_path', '')
+  endif
+  if empty(path)
+    echomsg '[SimpleRemote] active window is not a remote file'
+    return
+  endif
+  var parent = RemoteParent(path)
+  SetRemoteTreeRoot(parent)
+  OpenRemoteTree(parent, path)
+enddef
+
 def RefreshRemoteTree()
   if empty(s_tree)
     return
@@ -1983,17 +2118,35 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> q <Cmd>call g:SimpleRemoteTreeClose()<CR>
   nnoremap <silent><buffer> <Esc> <Cmd>call g:SimpleRemoteTreeClose()<CR>
   nnoremap <silent><buffer> <CR> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
+  nnoremap <silent><buffer> o <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
   nnoremap <silent><buffer> l <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
+  nnoremap <silent><buffer> <Right> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
+  nnoremap <silent><buffer> <2-LeftMouse> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
   nnoremap <silent><buffer> s <Cmd>call g:SimpleRemoteTreeActivate('split')<CR>
+  nnoremap <silent><buffer> S <Cmd>call g:SimpleRemoteTreeActivate('split')<CR>
   nnoremap <silent><buffer> v <Cmd>call g:SimpleRemoteTreeActivate('vsplit')<CR>
+  nnoremap <silent><buffer> V <Cmd>call g:SimpleRemoteTreeActivate('vsplit')<CR>
   nnoremap <silent><buffer> t <Cmd>call g:SimpleRemoteTreeActivate('tabedit')<CR>
+  nnoremap <silent><buffer> <C-x> <Cmd>call g:SimpleRemoteTreeActivate('split')<CR>
+  nnoremap <silent><buffer> <C-v> <Cmd>call g:SimpleRemoteTreeActivate('vsplit')<CR>
+  nnoremap <silent><buffer> <C-t> <Cmd>call g:SimpleRemoteTreeActivate('tabedit')<CR>
+  nnoremap <silent><buffer> P <Cmd>call g:SimpleRemoteTreeActivate('pedit')<CR>
   nnoremap <silent><buffer> h <Cmd>call g:SimpleRemoteTreeParent()<CR>
+  nnoremap <silent><buffer> <Left> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <BS> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
+  nnoremap <silent><buffer> R <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
+  nnoremap <silent><buffer> H <Cmd>call g:SimpleRemoteTreeToggleHidden()<CR>
+  nnoremap <silent><buffer> z <Cmd>call g:SimpleRemoteTreeCollapseAll()<CR>
+  nnoremap <silent><buffer> f <Cmd>call g:SimpleRemoteTreeRevealActive()<CR>
+  nnoremap <silent><buffer> / <Cmd>call g:SimpleRemoteTreeFind(1, 1)<CR>
+  nnoremap <silent><buffer> ]f <Cmd>call g:SimpleRemoteTreeFind(0, 1)<CR>
+  nnoremap <silent><buffer> [f <Cmd>call g:SimpleRemoteTreeFind(0, -1)<CR>
   nnoremap <silent><buffer> e <Cmd>call g:SimpleRemoteTreeRootHere()<CR>
   nnoremap <silent><buffer> U <Cmd>call g:SimpleRemoteTreeRootUp()<CR>
   nnoremap <silent><buffer> C <Cmd>call g:SimpleRemoteTreeRootPrompt()<CR>
   nnoremap <silent><buffer> . <Cmd>call g:SimpleRemoteTreeRootReset()<CR>
+  nnoremap <silent><buffer> ? <Cmd>call g:SimpleRemoteTreeHelp()<CR>
   nnoremap <silent><buffer> y <Cmd>call g:SimpleRemoteTreeYank(0)<CR>
   nnoremap <silent><buffer> Y <Cmd>call g:SimpleRemoteTreeYank(1)<CR>
   nnoremap <silent><buffer> gy <Cmd>call g:SimpleRemoteTreeCopyContents()<CR>
@@ -2009,6 +2162,7 @@ def OpenRemoteTree(path: string, reveal: string = '')
     errors: {},
     git: {},
     expanded: {path: true},
+    find_query: '',
   }
   LoadRemoteTree(path)
 enddef
@@ -2302,6 +2456,26 @@ def g:SimpleRemoteTreeRootReset()
   RemoteTreeRootReset()
 enddef
 
+def g:SimpleRemoteTreeHelp()
+  RemoteTreeHelp()
+enddef
+
+def g:SimpleRemoteTreeToggleHidden()
+  RemoteTreeToggleHidden()
+enddef
+
+def g:SimpleRemoteTreeCollapseAll()
+  RemoteTreeCollapseAll()
+enddef
+
+def g:SimpleRemoteTreeFind(ask: number, direction: number)
+  RemoteTreeFind(ask != 0, direction)
+enddef
+
+def g:SimpleRemoteTreeRevealActive()
+  RemoteTreeRevealActive()
+enddef
+
 def g:SimpleRemoteTreeSetRoot(path: string): bool
   return SetRemoteTreeRoot(path)
 enddef
@@ -2339,10 +2513,22 @@ enddef
 
 def g:SimpleRemoteTreeStatusline(): string
   var latency = get(get(s_remote, 'runtime_probe', {}), 'runtime_ms', '')
-  return empty(s_remote) ? ' SimpleRemote ' : printf(' %s:%s%s  %s ',
+  var flags: list<string> = []
+  if !get(g:, 'simpleremote_tree_show_hidden', 1)
+    add(flags, 'hidden:off')
+  endif
+  var query = get(s_tree, 'find_query', '')
+  if !empty(query)
+    add(flags, 'find:' .. query)
+  endif
+  if get(s_remote, 'tree_root', s_remote.root) !=# s_remote.root
+    add(flags, 'detached-root')
+  endif
+  var detail = empty(flags) ? '' : '  [' .. join(flags, ' ') .. ']'
+  return empty(s_remote) ? ' SimpleRemote ' : printf(' %s:%s%s  %s%s  [? keys] ',
     s_remote.kind, s_remote.target,
     empty(latency) ? '' : '@' .. latency .. 'ms',
-    get(b:, 'simpleremote_tree_path', s_remote.root))
+    get(b:, 'simpleremote_tree_path', s_remote.root), detail)
 enddef
 
 def g:SimpleRemoteTerminal()

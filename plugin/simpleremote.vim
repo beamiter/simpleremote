@@ -90,6 +90,7 @@ command! -nargs=0 SimpleRemoteProbe call g:SimpleRemoteProbe()
 command! -nargs=0 SimpleRemoteCopy call g:SimpleRemoteTreeCopyOut()
 command! -nargs=0 SimpleRemoteCopyContents call g:SimpleRemoteTreeCopyContents()
 command! -nargs=1 SimpleRemoteTreeRoot call g:SimpleRemoteTreeSetRoot(<q-args>)
+command! -nargs=0 SimpleRemoteTreeFind call g:SimpleRemoteTreeFind(1, 1)
 
 nnoremap <silent> <Plug>(simpleremote-open) <Cmd>SimpleRemote<CR>
 nnoremap <silent> <Plug>(simpleremote-connect) <Cmd>SimpleRemoteConnect<CR>

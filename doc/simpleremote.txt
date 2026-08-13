@@ -183,6 +183,11 @@ TREE ROOT INTEGRATION                           *simpleremote-tree-root*
   U     Move the tree root to its parent, up to the remote filesystem root.
   C     Prompt for any absolute remote directory.
   .     Restore the connected workspace root.
+  ?     Open the complete remote-tree key reference popup.
+
+The virtual tree also accepts SimpleTree-compatible navigation aliases:
+o/Right, Left, S/V/t, CTRL-X/CTRL-V/CTRL-T, P preview, H hidden files,
+z collapse all, f reveal active, / find, and ]f/[f find cycling.
 
 *:SimpleRemoteTreeRoot* {path}
         Set the visible tree root without changing the connection or LSP
