@@ -1706,15 +1706,22 @@ def RenderRemoteTree(buf: number)
   setbufvar(buf, 'simpleremote_tree_path', root)
   setbufvar(buf, '&modifiable', 0)
   if !empty(focus_path)
+    var focused = false
     for index in range(0, len(nodes) - 1)
       if get(nodes[index], 'path', '') ==# focus_path
         if winid > 0
           win_execute(winid, printf('cursor(%d, 1)', index + 1))
         endif
+        focused = true
         break
       endif
     endfor
-    s_tree.reveal = ''
+    # Git metadata and the directory listing race independently.  Keep the
+    # reveal target until a render actually contains it; clearing it after an
+    # earlier loading/metadata render leaves the cursor on the header forever.
+    if focused
+      s_tree.reveal = ''
+    endif
   endif
 enddef
 
@@ -3028,7 +3035,26 @@ def OpenRemoteTree(path: string, reveal: string = '')
   LoadRemoteTree(path)
 enddef
 
-def OpenWorkspaceTree()
+def ActiveRemotePath(): string
+  if !IsReady()
+    return ''
+  endif
+  var info = get(b:, 'vimrc_remote', {})
+  var path = type(info) == v:t_dict ? get(info, 'path', '') : ''
+  if empty(path)
+    path = get(b:, 'simpleremote_path', '')
+  endif
+  return type(path) == v:t_string && UnderRoot(path, s_remote.root) ? path : ''
+enddef
+
+def RevealSimpleTree(path: string)
+  if empty(path) || exists(':SimpleTreeReveal') != 2
+    return
+  endif
+  execute 'SimpleTreeReveal ' .. fnameescape(path)
+enddef
+
+def OpenWorkspaceTree(reveal: string = '')
   if empty(s_remote) || !IsReady()
     if exists(':SimpleTree') == 2
       execute 'SimpleTree'
@@ -3048,15 +3074,29 @@ def OpenWorkspaceTree()
     CloseRemoteTree()
     if exists(':SimpleTree') == 2
       if SimpleTreeVisible() && SetSimpleTreeRoot(local_tree_root)
+        if !empty(reveal) && UnderRoot(reveal, s_remote.root)
+          RevealSimpleTree(RemoteTreeLocalPath(reveal))
+        endif
         return
       endif
       execute 'SimpleTree ' .. fnameescape(local_tree_root)
+      if !empty(reveal) && UnderRoot(reveal, s_remote.root)
+        RevealSimpleTree(RemoteTreeLocalPath(reveal))
+      endif
     elseif exists(':Explore') == 2
       execute 'Explore ' .. fnameescape(local_tree_root)
     endif
     return
   endif
-  OpenRemoteTree(get(s_remote, 'tree_root', s_remote.root))
+  # The virtual tree cannot rely on SimpleTree's local-path reveal.  Root its
+  # view at the active file's parent so the first asynchronous listing already
+  # contains the row that must receive focus.  This changes only the view, not
+  # the connected workspace root.
+  if !empty(reveal) && UnderRoot(reveal, s_remote.root)
+    OpenRemoteTree(RemoteParent(reveal), reveal)
+  else
+    OpenRemoteTree(get(s_remote, 'tree_root', s_remote.root))
+  endif
 enddef
 
 def RemoteTreeActivate(action: string)
@@ -3269,7 +3309,10 @@ def g:SimpleRemoteTreeToggle()
   if buf > 0 && bufwinid(buf) > 0
     CloseRemoteTree()
   else
-    OpenWorkspaceTree()
+    # Capture before opening/focusing the tree changes the current buffer.
+    # A remote:// buffer is not a real local path, so projected workspaces
+    # explicitly translate it before asking SimpleTree to reveal the row.
+    OpenWorkspaceTree(ActiveRemotePath())
   endif
 enddef
 

@@ -9,6 +9,7 @@ const BASE = tempname()
 const BOOKMARKS = BASE .. '-bookmarks.json'
 mkdir(BASE .. '/dest', 'p')
 writefile(['a'], BASE .. '/alpha.txt')
+writefile(['nested'], BASE .. '/dest/nested.txt')
 writefile(['bbbbbbbb'], BASE .. '/beta.log')
 writefile(['ignored'], BASE .. '/ignored.log')
 writefile(['{"workspace": "virtual-tree"}'], BASE .. '/simplecc.json')
@@ -92,6 +93,30 @@ def Run()
   g:SimpleRemoteTreeToggle()
   assert_true(WaitFor(() => PathLine(BASE .. '/alpha.txt') > 0),
     'virtual tree did not load its root')
+
+  # Opening the virtual tree from a remote file must reveal and select that
+  # file, including files below the workspace root.  Close the initial tree so
+  # the second toggle follows the same path as F3 from an editor window.
+  g:SimpleRemoteTreeToggle()
+  g:VimrcRemoteOpen(BASE .. '/dest/nested.txt')
+  assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '')
+    ==# BASE .. '/dest/nested.txt'), 'nested remote buffer did not load')
+  g:SimpleRemoteTreeToggle()
+  assert_true(WaitFor(() => PathLine(BASE .. '/dest/nested.txt') > 0),
+    'virtual tree did not load the active file parent')
+  var reveal_winid = TreeWin()
+  var reveal_nodes = TreeNodes()
+  var reveal_index = getcurpos(reveal_winid)[1] - 1
+  assert_true(reveal_index >= 0 && reveal_index < len(reveal_nodes),
+    'virtual tree reveal cursor is outside its node list')
+  if reveal_index >= 0 && reveal_index < len(reveal_nodes)
+    assert_equal(BASE .. '/dest/nested.txt',
+      get(reveal_nodes[reveal_index], 'path', ''),
+      'virtual tree did not focus the active remote file')
+  endif
+  assert_true(g:SimpleRemoteTreeSetRoot(BASE))
+  assert_true(WaitFor(() => PathLine(BASE .. '/dest') > 0),
+    'virtual tree did not restore the workspace root after reveal')
 
   var winid = TreeWin()
   win_gotoid(winid)

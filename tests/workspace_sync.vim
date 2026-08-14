@@ -22,6 +22,17 @@ g:simpleremote_local_roots['ssh:' .. TARGET .. ':' .. BASE] = BASE
 execute 'set runtimepath^=' .. fnameescape(REPO)
 runtime plugin/simpleremote.vim
 
+g:captured_simpletree_root = ''
+g:captured_simpletree_reveal = ''
+def g:CaptureSimpleTree(root: string)
+  g:captured_simpletree_root = root
+enddef
+def g:CaptureSimpleTreeReveal(path: string)
+  g:captured_simpletree_reveal = path
+enddef
+command! -nargs=? SimpleTree call g:CaptureSimpleTree(<q-args>)
+command! -nargs=? SimpleTreeReveal call g:CaptureSimpleTreeReveal(<q-args>)
+
 def WaitForRoot(root: string, timeout: float = 4.0): bool
   var started = reltime()
   while reltimefloat(reltime(started)) < timeout
@@ -103,6 +114,16 @@ def Run()
     'public remote read did not complete')
   assert_true(read_ok)
   assert_equal("finder preview\n", read_body)
+
+  # Remote buffers keep a remote:// name even when the workspace has a local
+  # projection.  F3's tree wrapper must translate the active remote file to
+  # the projected path and explicitly reveal it after opening SimpleTree.
+  g:VimrcRemoteOpen(BASE .. '/finder.txt')
+  assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '')
+    ==# BASE .. '/finder.txt'), 'remote fixture buffer did not finish loading')
+  g:SimpleRemoteTreeToggle()
+  assert_equal(BASE, g:captured_simpletree_root)
+  assert_equal(BASE .. '/finder.txt', g:captured_simpletree_reveal)
 
   var rejected = false
   assert_equal(-1, g:SimpleRemoteReadFile('/outside-workspace', (_, body) => {
