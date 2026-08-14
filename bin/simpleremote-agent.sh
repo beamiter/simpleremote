@@ -75,6 +75,7 @@ encode_file() {
 }
 list_directory() {
   list_root=$1
+  list_meta=${2:-0}
   for list_entry in "$list_root"/* "$list_root"/.[!.]* "$list_root"/..?*; do
     if [ ! -e "$list_entry" ] && [ ! -L "$list_entry" ]; then
       continue
@@ -87,7 +88,21 @@ list_directory() {
     else
       list_kind=f
     fi
-    printf '%s\t%s\n' "$list_name" "$list_kind"
+    if [ "$list_meta" -eq 1 ]; then
+      if list_metadata=$(stat -c '%s %Y' "$list_entry" 2>/dev/null); then
+        :
+      elif list_metadata=$(stat -f '%z %m' "$list_entry" 2>/dev/null); then
+        :
+      else
+        list_metadata='-1 -1'
+      fi
+      list_size=${list_metadata%% *}
+      list_mtime=${list_metadata#* }
+      printf '%s\t%s\t%s\t%s\n' \
+        "$list_name" "$list_kind" "$list_size" "$list_mtime"
+    else
+      printf '%s\t%s\n' "$list_name" "$list_kind"
+    fi
   done 2>/dev/null
 }
 
@@ -186,7 +201,7 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "cannot replace: $path"
       fi
       ;;
-    list)
+    list|list-meta)
       if ! path=$(decode "${payload:-}"); then
         reply "$id" error "invalid list payload"
         continue
@@ -200,7 +215,9 @@ while IFS="$tab" read -r id op payload; do
           reply "$id" error "cannot create list output file"
           continue
         }
-        if list_directory "$path" >"$list_output"; then
+        list_with_meta=0
+        [ "$op" != list-meta ] || list_with_meta=1
+        if list_directory "$path" "$list_with_meta" >"$list_output"; then
           reply_stream "$id" ok <"$list_output"
         else
           reply "$id" error "cannot list directory: $path"

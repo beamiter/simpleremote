@@ -41,35 +41,54 @@ Remote commands automatically prepend project `.venv`, `.conda`, `venv`, and
 project Python environments, and user-installed language servers available to
 non-login SSH sessions without sourcing interactive shell files into LSP stdio.
 
-## SimpleTree and SimpleClipboard copy workflow
+## SimpleTree-compatible virtual tree
 
-The virtual remote tree follows the SimpleTree copy vocabulary:
+The virtual remote tree now follows almost the complete SimpleTree key
+vocabulary. Filesystem actions execute on the remote target:
 
-- `c` streams the selected remote file through the Rust runtime into
-  `simpletree#ExternalDropDirectory()` (or prompts when no local tree exists).
-  The write is staged beside the destination and atomically activated.
-- `y` copies the file name and `Y` copies the absolute remote path.
-- `gy` copies remote text file contents, subject to
-  `g:simpleremote_clipboard_max_bytes` (1 MiB by default).
+- `c` / `x` collect the current node or marked nodes for remote copy/cut;
+  `p` pastes them into the selected directory. Directories are recursive and
+  every destination is collision-checked before the batch starts.
+- `a` / `n` create a file, `A` / `N` create a directory, `r` renames, and `D`
+  deletes after confirmation. Delete refuses the tree root and any subtree
+  containing an unsaved remote buffer.
+- `<Space>` marks a node or a Visual range, `gm` marks its visible siblings,
+  and `gM` clears all marks. Copy, cut, and delete consume the marked set.
+- `m` toggles a persistent target-scoped bookmark, `'` lists bookmarks, and
+  `]b` / `[b` cycle through visible bookmarks.
 
-All text and resulting local paths use `simpleclipboard#CopyText()` when
+`gd` retains the cross-boundary download workflow: it streams the selected
+remote file through the Rust runtime into `simpletree#ExternalDropDirectory()`
+(or prompts when no local tree exists). The write is staged beside the
+destination and atomically activated. `y` copies the file name, `Y` copies the
+absolute remote path, and `gy` copies remote text file contents subject to
+`g:simpleremote_clipboard_max_bytes` (1 MiB by default).
+
+All copied text and resulting local paths use `simpleclipboard#CopyText()` when
 available. Successful downloads emit `User SimpleRemoteFileCopied` with
-`g:simpleremote_event.remote` and `.local`, then refresh SimpleTree.
-Set `g:simpleremote_copy_destination` for a fixed local drop directory or
-`g:simpleremote_copy_prompt = 1` to confirm every destination.
+`g:simpleremote_event.remote` and `.local`, then refresh SimpleTree. Set
+`g:simpleremote_copy_destination` for a fixed local drop directory or
+`g:simpleremote_copy_prompt = 1` to confirm every download destination.
 
-The remote tree also shares SimpleTree's root-navigation vocabulary without
-changing the connected workspace or restarting SimpleCC: `e` uses the selected
-directory, `U` moves to its parent up to `/`, `C` accepts any absolute remote
-directory, and `.` returns to the workspace root. The connection and LSP keep
-their original project root while the tree browses elsewhere. When an SSHFS or
-bind mount covers only the workspace, browsing outside it automatically uses
-the virtual remote tree and returning inside restores the local SimpleTree.
+The remote tree also shares SimpleTree's root-navigation vocabulary: `e` uses
+the selected directory, `U` moves to its parent up to `/`, and `C` accepts any
+absolute remote directory. These explicit root changes now switch the real
+SimpleRemote workspace, so projection discovery, the working directory,
+remote config, and SimpleCC all follow the tree. The same synchronization runs
+when a projected SimpleTree emits `SimpleTreeRootChanged`; SimpleRemote tags
+its own `simpletree#ExternalSetRoot()` echo to avoid a reconnect loop. Set
+`g:simpleremote_sync_tree_root = 0` to retain detached browsing. `.` restores a
+view-only reveal to the current workspace root.
 Press `?` in the virtual remote tree for a complete key reference; the
 statusline keeps a visible `[? keys]` hint.
 
-The virtual tree mirrors SimpleTree's navigation surface: `o`, arrow keys,
-`S/V/t`, Ctrl split keys, `P` preview, `H` hidden files, `z` collapse all,
-`f` reveal active file, `/` find, and `]f`/`[f` match cycling. Existing
-lowercase split aliases remain available for compatibility. The statusline
-shows find, hidden-file, and detached-root state.
+The virtual tree also mirrors SimpleTree navigation and view state: `o` and
+arrow keys, `S/V/t`, Ctrl split keys, `P` preview, `R` refresh, `H` hidden
+files, `I` gitignore filtering, `s` sort mode, `gs` reverse sort, `F` loaded
+node filtering, `z` collapse all, `f` reveal active file, `/` find, and
+`]f`/`[f` match cycling. `L` locks root-changing actions. The statusline shows
+all active modes. Size and modification-time sorting use the bundled agent's
+`list-meta` capability; update an older installed agent with
+`:SimpleRemoteInstallAgent`. The only SimpleTree key in the documented panel
+without a virtual equivalent is `gx`, because a remote path has no reliable
+local system-default application.

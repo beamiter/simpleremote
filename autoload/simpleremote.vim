@@ -10,6 +10,10 @@ var s_connect_spec: dict<any> = {}
 var s_last_spec: dict<any> = {}
 var s_tree: dict<any> = {}
 var s_previous_cwd = ''
+var s_workspace_switch_timer = 0
+var s_tree_clipboard: dict<any> = {}
+var s_tree_bookmarks: dict<any> = {}
+var s_tree_bookmarks_loaded = false
 
 const PROTOCOL = 'simpleremote/2'
 
@@ -282,6 +286,10 @@ def StopSimpleCC(remote: dict<any>)
 enddef
 
 def Disconnect(show_message: bool = true)
+  if s_workspace_switch_timer > 0
+    timer_stop(s_workspace_switch_timer)
+    s_workspace_switch_timer = 0
+  endif
   if empty(s_remote)
     CloseRemoteTree()
     ClearGlobals()
@@ -1373,9 +1381,47 @@ def TreeIgnored(name: string): bool
   return false
 enddef
 
+const TREE_SORT_MODES = ['name', 'extension', 'mtime', 'size']
+
+def TreeSortMode(): string
+  var mode = get(s_tree, 'sort', get(g:, 'simpleremote_tree_sort', 'name'))
+  return index(TREE_SORT_MODES, mode) >= 0 ? mode : 'name'
+enddef
+
+def TreeTextCompare(left: string, right: string): number
+  var a = tolower(left)
+  var b = tolower(right)
+  return a ==# b ? (left ==# right ? 0 : left <# right ? -1 : 1)
+    : a <# b ? -1 : 1
+enddef
+
+def TreeNodeCompare(left: dict<any>, right: dict<any>): number
+  var left_dir = left.type ==# 'd'
+  var right_dir = right.type ==# 'd'
+  if left_dir != right_dir
+    return left_dir ? -1 : 1
+  endif
+  var mode = TreeSortMode()
+  var result = 0
+  if mode ==# 'extension'
+    result = TreeTextCompare(fnamemodify(left.name, ':e'),
+      fnamemodify(right.name, ':e'))
+  elseif mode ==# 'mtime' || mode ==# 'size'
+    var a = get(left, mode, -1)
+    var b = get(right, mode, -1)
+    if a != b
+      # Metadata modes show newest/largest first, matching SimpleTree.
+      result = a > b ? -1 : 1
+    endif
+  endif
+  if result == 0
+    result = TreeTextCompare(left.name, right.name)
+  endif
+  return get(s_tree, 'sort_reverse', false) ? -result : result
+enddef
+
 def ParseTreeDirectory(path: string, body: string): list<dict<any>>
-  var directories: list<dict<any>> = []
-  var files: list<dict<any>> = []
+  var nodes: list<dict<any>> = []
   for line in split(body, '\n')
     var fields = split(line, "\t", 1)
     if len(fields) < 2 || empty(fields[0]) || TreeIgnored(fields[0])
@@ -1385,18 +1431,13 @@ def ParseTreeDirectory(path: string, body: string): list<dict<any>>
       name: fields[0],
       path: JoinRemotePath(path, fields[0]),
       type: fields[1],
+      size: len(fields) > 2 ? str2nr(fields[2]) : -1,
+      mtime: len(fields) > 3 ? str2nr(fields[3]) : -1,
     }
-    if node.type ==# 'd'
-      add(directories, node)
-    else
-      add(files, node)
-    endif
+    add(nodes, node)
   endfor
-  sort(directories, (a, b) =>
-    a.name ==? b.name ? 0 : a.name <? b.name ? -1 : 1)
-  sort(files, (a, b) =>
-    a.name ==? b.name ? 0 : a.name <? b.name ? -1 : 1)
-  return directories + files
+  sort(nodes, TreeNodeCompare)
+  return nodes
 enddef
 
 def TreeStatusRank(status: string): number
@@ -1426,19 +1467,29 @@ def OnTreeGit(generation: number, epoch: number, ok: bool, body: string)
   endif
   var root = s_tree.root
   var statuses: dict<string> = {}
+  var ignored: dict<bool> = {}
   for line in split(body, '\n', 1)
     if len(line) < 4
       continue
     endif
-    var status = TreeGitStatus(strpart(line, 0, 2))
+    var code = strpart(line, 0, 2)
     var relative = strpart(line, 3)
-    if empty(status) || empty(relative)
+    if empty(relative)
       continue
     endif
     if relative =~# ' -> '
       relative = split(relative, ' -> ', 1)[-1]
     endif
+    relative = substitute(relative, '/\+$', '', '')
     var path = JoinRemotePath(root, relative)
+    if code ==# '!!'
+      ignored[path] = true
+      continue
+    endif
+    var status = TreeGitStatus(code)
+    if empty(status)
+      continue
+    endif
     statuses[path] = status
     var parent = RemoteParent(path)
     while parent !=# root && UnderRoot(parent, root)
@@ -1449,11 +1500,13 @@ def OnTreeGit(generation: number, epoch: number, ok: bool, body: string)
     endwhile
   endfor
   s_tree.git = statuses
+  s_tree.git_ignored = ignored
   RenderRemoteTree(s_tree.buf)
 enddef
 
 def LoadTreeGit()
-  if !get(g:, 'simpleremote_tree_show_git_status', 1) || empty(s_tree)
+  if (!get(g:, 'simpleremote_tree_show_git_status', 1)
+      && !get(s_tree, 'git_ignore', true)) || empty(s_tree)
     return
   endif
   var generation = s_remote.generation
@@ -1461,9 +1514,55 @@ def LoadTreeGit()
   var root = s_tree.root
   var command = 'cd ' .. shellescape(root)
     .. ' && if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then '
-    .. 'git -c core.quotepath=false status --porcelain=v1 --untracked-files=all; fi'
+    .. 'git -c core.quotepath=false status --porcelain=v1 '
+    .. '--untracked-files=all --ignored=matching; fi'
   Send('exec', command,
     (ok, body) => OnTreeGit(generation, epoch, ok, body))
+enddef
+
+def TreePathGitIgnored(path: string): bool
+  if !get(s_tree, 'git_ignore', true)
+    return false
+  endif
+  var current = path
+  var ignored = get(s_tree, 'git_ignored', {})
+  while UnderRoot(current, s_tree.root)
+    if has_key(ignored, current)
+      return true
+    endif
+    if current ==# s_tree.root
+      break
+    endif
+    current = RemoteParent(current)
+  endwhile
+  return false
+enddef
+
+def TreeFilterMatches(node: dict<any>): bool
+  var query = tolower(get(s_tree, 'filter_query', ''))
+  if empty(query) || stridx(tolower(node.name), query) >= 0
+        || stridx(tolower(node.path), query) >= 0
+    return true
+  endif
+  if node.type !=# 'd'
+    return false
+  endif
+  for child in get(get(s_tree, 'cache', {}), node.path, [])
+    if !TreePathGitIgnored(child.path) && TreeFilterMatches(child)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def TreeVisibleChildren(parent: string): list<dict<any>>
+  var children: list<dict<any>> = []
+  for node in get(get(s_tree, 'cache', {}), parent, [])
+    if !TreePathGitIgnored(node.path) && TreeFilterMatches(node)
+      add(children, node)
+    endif
+  endfor
+  return children
 enddef
 
 def TreePrefix(ancestors: list<bool>, last: bool, icons: dict<any>): string
@@ -1488,7 +1587,7 @@ enddef
 def AppendTreeChildren(parent: string, ancestors: list<bool>,
     lines: list<string>, nodes: list<dict<any>>)
   var icons = TreeIcons()
-  var children = get(get(s_tree, 'cache', {}), parent, [])
+  var children = TreeVisibleChildren(parent)
   for index in range(0, len(children) - 1)
     var node = copy(children[index])
     var last = index == len(children) - 1
@@ -1502,6 +1601,12 @@ def AppendTreeChildren(parent: string, ancestors: list<bool>,
     var badge = TreeBadge(status)
     if !empty(badge)
       body ..= repeat(' ', max([2, TreeWidth() - strdisplaywidth(body) - 1])) .. badge
+    endif
+    if TreeBookmarked(node.path)
+      body ..= ' ' .. get(g:, 'simpleremote_tree_bookmark_symbol', '★')
+    endif
+    if has_key(get(s_tree, 'marked', {}), node.path)
+      body ..= ' ' .. get(g:, 'simpleremote_tree_mark_symbol', '✓')
     endif
     node.expanded = expanded
     node.parent = parent
@@ -1539,6 +1644,8 @@ def SetupRemoteTreeSyntax()
   highlight default link SimpleRemoteTreeGitUntracked Comment
   highlight default link SimpleRemoteTreeGitConflict ErrorMsg
   highlight default link SimpleRemoteTreeGitDeleted DiffDelete
+  highlight default link SimpleRemoteTreeMarked Special
+  highlight default link SimpleRemoteTreeBookmark Special
   syntax clear
   syntax match SimpleRemoteTreeTitle /\%1l.*/
   syntax match SimpleRemoteTreeMeta /\%2l.*/
@@ -1552,6 +1659,10 @@ def SetupRemoteTreeSyntax()
   syntax match SimpleRemoteTreeGitUntracked /?$/
   syntax match SimpleRemoteTreeGitConflict /!$/
   syntax match SimpleRemoteTreeGitDeleted /D$/
+  execute 'syntax match SimpleRemoteTreeMarked /'
+    .. escape(get(g:, 'simpleremote_tree_mark_symbol', '✓'), '/') .. '$/'
+  execute 'syntax match SimpleRemoteTreeBookmark /'
+    .. escape(get(g:, 'simpleremote_tree_bookmark_symbol', '★'), '/') .. '\%($\|\s\)/'
 enddef
 
 def RenderRemoteTree(buf: number)
@@ -1601,7 +1712,7 @@ def RenderRemoteTree(buf: number)
 enddef
 
 def OnTreeList(generation: number, epoch: number, buf: number, path: string,
-    ok: bool, body: string)
+    metadata: bool, ok: bool, body: string)
   if !IsCurrent(generation) || !bufexists(buf) || empty(s_tree)
         || s_tree.buf != buf || s_tree.epoch != epoch
     return
@@ -1610,10 +1721,18 @@ def OnTreeList(generation: number, epoch: number, buf: number, path: string,
     remove(s_tree.loading, path)
   endif
   if ok
+    if metadata
+      s_tree.metadata_supported = 1
+    endif
     s_tree.cache[path] = ParseTreeDirectory(path, body)
     if has_key(s_tree.errors, path)
       remove(s_tree.errors, path)
     endif
+  elseif metadata && body =~# '^unknown operation:'
+    # Older installed agents remain usable; only size/mtime sorting degrades.
+    s_tree.metadata_supported = 0
+    LoadTreeDirectory(path, true)
+    return
   else
     s_tree.errors[path] = body
   endif
@@ -1635,9 +1754,11 @@ def LoadTreeDirectory(path: string, force: bool = false)
   var generation = s_remote.generation
   var epoch = s_tree.epoch
   var buf = s_tree.buf
+  var metadata = index(['mtime', 'size'], TreeSortMode()) >= 0
+    && get(s_tree, 'metadata_supported', -1) != 0
   RenderRemoteTree(buf)
-  Send('list', path,
-    (ok, body) => OnTreeList(generation, epoch, buf, path, ok, body))
+  Send(metadata ? 'list-meta' : 'list', path,
+    (ok, body) => OnTreeList(generation, epoch, buf, path, metadata, ok, body))
 enddef
 
 def LoadRemoteTree(path: string)
@@ -1651,6 +1772,8 @@ def LoadRemoteTree(path: string)
     s_tree.loading = {}
     s_tree.errors = {}
     s_tree.git = {}
+    s_tree.git_ignored = {}
+    s_tree.marked = {}
     s_tree.expanded = {path: true}
   endif
   LoadTreeDirectory(path)
@@ -1674,6 +1797,76 @@ def SimpleTreeVisible(): bool
   return false
 enddef
 
+def SetSimpleTreeRoot(path: string): bool
+  if exists('*simpletree#ExternalSetRoot') != 1
+    return false
+  endif
+  try
+    # New SimpleTree versions publish this source in RootChanged, allowing the
+    # listener below to distinguish our projection echo from a user re-root.
+    return simpletree#ExternalSetRoot(path, 'simpleremote')
+  catch
+    # Keep mixed-version installations useful while SimpleTree rolls out the
+    # optional source argument.  A same-root event is harmlessly deduplicated.
+    return simpletree#ExternalSetRoot(path)
+  endtry
+enddef
+
+def WorkspaceSwitchOptions(local_root: string): dict<any>
+  var options = copy(get(s_remote, 'options', {}))
+  options.open_tree = SimpleTreeVisible() || !empty(s_tree)
+
+  # A profile local_root describes the old remote root.  Carrying it to a new
+  # SSHFS or Docker workspace would project the wrong directory.  Explicit
+  # local maps are the exception: a SimpleTree path gives us the exact new
+  # local half of that mapping.
+  if get(s_remote, 'workspace_mode', '') ==# 'local-map' && !empty(local_root)
+    options.local_root = local_root
+  elseif has_key(options, 'local_root')
+    remove(options, 'local_root')
+  endif
+  return options
+enddef
+
+def SwitchWorkspaceRoot(generation: number, root: string, local_root: string,
+    source: string)
+  s_workspace_switch_timer = 0
+  if !IsCurrent(generation) || !IsReady() || root ==# s_remote.root
+    return
+  endif
+  var kind = s_remote.kind
+  var target = s_remote.target
+  var options = WorkspaceSwitchOptions(local_root)
+  echomsg printf('[SimpleRemote] workspace root -> %s (%s)', root, source)
+  Connect(kind, target, root, options)
+enddef
+
+def QueueWorkspaceRoot(path: string, local_root: string = '',
+    source: string = 'tree'): bool
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return false
+  endif
+  var target = NormalizeTreeRoot(path)
+  if empty(target)
+    Error('[SimpleRemote] workspace root must be an absolute remote path')
+    return false
+  endif
+  if target ==# s_remote.root
+    # This is usually our own tree projection arriving through an older
+    # SimpleTree that does not publish a source.  Keep detached/reveal views
+    # coherent without reconnecting to the workspace we already have.
+    return SetRemoteTreeRoot(target, false)
+  endif
+  if s_workspace_switch_timer > 0
+    timer_stop(s_workspace_switch_timer)
+  endif
+  var generation = s_remote.generation
+  s_workspace_switch_timer = timer_start(0,
+    (_) => SwitchWorkspaceRoot(generation, target, local_root, source))
+  return true
+enddef
+
 def RemoteTreeLocalPath(remote_path: string): string
   var base = substitute(get(s_remote, 'local_root', ''), '[\\/]\+$', '', '')
   var suffix = strpart(remote_path, len(s_remote.root))
@@ -1692,6 +1885,9 @@ def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
     Error('[SimpleRemote] tree root must be an absolute remote path')
     return false
   endif
+  if sync_view && get(g:, 'simpleremote_sync_tree_root', 1)
+    return QueueWorkspaceRoot(target, '', 'remote-tree')
+  endif
   s_remote.tree_root = target
   g:simpleremote_workspace = WorkspaceSnapshot()
   Emit('SimpleRemoteTreeRootChanged', {
@@ -1703,7 +1899,7 @@ def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
   if sync_view && !empty(local_root) && UnderRoot(target, s_remote.root)
         && SimpleTreeVisible() && exists('*simpletree#ExternalSetRoot') == 1
     var local_target = RemoteTreeLocalPath(target)
-    if !simpletree#ExternalSetRoot(local_target)
+    if !SetSimpleTreeRoot(local_target)
       Error('[SimpleRemote] local tree root is unavailable: ' .. local_target)
       return false
     endif
@@ -1727,6 +1923,10 @@ def SetRemoteTreeRoot(path: string, sync_view: bool = true): bool
 enddef
 
 def RemoteTreeRootHere()
+  if get(s_tree, 'root_locked', false)
+    echomsg '[SimpleRemote] root is locked; press L to unlock'
+    return
+  endif
   var node = CurrentRemoteTreeNode()
   if empty(node)
     return
@@ -1737,6 +1937,10 @@ def RemoteTreeRootHere()
 enddef
 
 def RemoteTreeRootUp()
+  if get(s_tree, 'root_locked', false)
+    echomsg '[SimpleRemote] root is locked; press L to unlock'
+    return
+  endif
   var current = get(s_tree, 'root', get(s_remote, 'tree_root', s_remote.root))
   if current ==# '/'
     echomsg '[SimpleRemote] already at remote filesystem root'
@@ -1746,6 +1950,10 @@ def RemoteTreeRootUp()
 enddef
 
 def RemoteTreeRootPrompt()
+  if get(s_tree, 'root_locked', false)
+    echomsg '[SimpleRemote] root is locked; press L to unlock'
+    return
+  endif
   var current = get(s_tree, 'root', get(s_remote, 'tree_root', s_remote.root))
   var target = input('Remote tree root: ', current)
   if !empty(target)
@@ -1754,7 +1962,39 @@ def RemoteTreeRootPrompt()
 enddef
 
 def RemoteTreeRootReset()
+  if get(s_tree, 'root_locked', false)
+    echomsg '[SimpleRemote] root is locked; press L to unlock'
+    return
+  endif
   SetRemoteTreeRoot(s_remote.root)
+enddef
+
+def RemoteTreeRootCurrent()
+  if get(s_tree, 'root_locked', false)
+    echomsg '[SimpleRemote] root is locked; press L to unlock'
+    return
+  endif
+  var source = get(s_tree, 'source_win', 0)
+  var windows = source > 0 ? getwininfo(source) : []
+  if empty(windows)
+    echomsg '[SimpleRemote] no active remote file window'
+    return
+  endif
+  var path = get(getbufvar(windows[0].bufnr, 'vimrc_remote', {}), 'path', '')
+  if empty(path)
+    path = getbufvar(windows[0].bufnr, 'simpleremote_path', '')
+  endif
+  if empty(path)
+    echomsg '[SimpleRemote] active window is not a remote file'
+    return
+  endif
+  SetRemoteTreeRoot(RemoteParent(path))
+enddef
+
+def RemoteTreeToggleRootLock()
+  s_tree.root_locked = !get(s_tree, 'root_locked', false)
+  RenderRemoteTree(s_tree.buf)
+  echomsg '[SimpleRemote] root lock: ' .. (s_tree.root_locked ? 'ON' : 'OFF')
 enddef
 
 var s_tree_help_popup: number = 0
@@ -1791,6 +2031,7 @@ def RemoteTreeHelp()
     '  <CR> / o / l / Right   open or expand',
     '  h / Left / <BS>        collapse / parent node',
     '  S / V / t              split / vsplit / tab',
+    '  C-x / C-v / C-t        split / vsplit / tab',
     '  P                      preview file',
     '  f                      reveal active remote file',
     '',
@@ -1799,15 +2040,30 @@ def RemoteTreeHelp()
     '  U            tree root goes up (up to remote /)',
     '  C            enter any absolute remote tree root',
     '  .            restore connected workspace root',
+    '  d            active remote file directory becomes root',
+    '  L            toggle root lock',
     '',
-    'COPY',
-    '  c            download file into local SimpleTree',
+    'FILES',
+    '  c / x / p    copy / cut / paste remote nodes',
+    '  a / n        create file in target directory',
+    '  A / N        create folder in target directory',
+    '  r / D        rename / delete remote nodes',
+    '  gd           download file into local SimpleTree',
     '  gy           copy remote file contents',
     '  y / Y        copy file name / absolute remote path',
     '',
+    'MARKS AND BOOKMARKS',
+    '  Space        toggle mark (Visual: mark range)',
+    '  gm / gM      mark siblings / clear marks',
+    "  m / '        toggle / list persistent bookmark",
+    '  ]b / [b      next / previous visible bookmark',
+    '',
     'GENERAL',
-    '  R / r        refresh tree',
+    '  R            refresh tree',
     '  H            toggle hidden files',
+    '  I            toggle gitignore filtering',
+    '  s / gs       cycle / reverse sort',
+    '  F            filter loaded nodes (empty clears)',
     '  z            collapse all directories',
     '  /            find a visible node',
     '  ]f / [f      next / previous find match',
@@ -1842,6 +2098,53 @@ def RemoteTreeToggleHidden()
   RefreshRemoteTree()
   echomsg '[SimpleRemote] hidden files: '
     .. (g:simpleremote_tree_show_hidden ? 'shown' : 'hidden')
+enddef
+
+def RemoteTreeToggleGitIgnore()
+  s_tree.git_ignore = !get(s_tree, 'git_ignore', true)
+  if s_tree.git_ignore && empty(get(s_tree, 'git_ignored', {}))
+    LoadTreeGit()
+  else
+    RenderRemoteTree(s_tree.buf)
+  endif
+  echomsg '[SimpleRemote] gitignore filter: '
+    .. (s_tree.git_ignore ? 'ON' : 'OFF')
+enddef
+
+def RemoteTreeFilter()
+  var query = input('Filter loaded remote nodes: ',
+    get(s_tree, 'filter_query', ''))
+  s_tree.filter_query = query
+  RenderRemoteTree(s_tree.buf)
+  echomsg empty(query) ? '[SimpleRemote] filter cleared'
+    : '[SimpleRemote] filter: ' .. query
+enddef
+
+def RemoteTreeSortCycle()
+  var current = TreeSortMode()
+  var index = index(TREE_SORT_MODES, current)
+  s_tree.sort = TREE_SORT_MODES[(index + 1) % len(TREE_SORT_MODES)]
+  g:simpleremote_tree_sort = s_tree.sort
+  if index(['mtime', 'size'], s_tree.sort) >= 0
+    ReloadRemoteTree(true)
+  else
+    for path in keys(s_tree.cache)
+      sort(s_tree.cache[path], TreeNodeCompare)
+    endfor
+    RenderRemoteTree(s_tree.buf)
+  endif
+  echomsg '[SimpleRemote] sort: ' .. s_tree.sort
+enddef
+
+def RemoteTreeSortReverse()
+  s_tree.sort_reverse = !get(s_tree, 'sort_reverse', false)
+  g:simpleremote_tree_sort_reverse = s_tree.sort_reverse ? 1 : 0
+  for path in keys(s_tree.cache)
+    sort(s_tree.cache[path], TreeNodeCompare)
+  endfor
+  RenderRemoteTree(s_tree.buf)
+  echomsg '[SimpleRemote] sort reverse: '
+    .. (s_tree.sort_reverse ? 'ON' : 'OFF')
 enddef
 
 def RemoteTreeCollapseAll()
@@ -1911,11 +2214,13 @@ def RemoteTreeRevealActive()
     return
   endif
   var parent = RemoteParent(path)
-  SetRemoteTreeRoot(parent)
+  # Reveal is view-only.  Explicit root navigation (e/U/C) changes the real
+  # workspace, but locating the active file must not restart it.
+  SetRemoteTreeRoot(parent, false)
   OpenRemoteTree(parent, path)
 enddef
 
-def RefreshRemoteTree()
+def ReloadRemoteTree(force: bool = false)
   if empty(s_tree)
     return
   endif
@@ -1925,9 +2230,19 @@ def RefreshRemoteTree()
   s_tree.loading = {}
   s_tree.errors = {}
   s_tree.git = {}
-  s_tree.expanded = {root: true}
-  LoadTreeDirectory(root, true)
+  s_tree.git_ignored = {}
+  if force
+    s_tree.metadata_supported = -1
+  endif
+  s_tree.expanded[root] = true
+  for path in keys(s_tree.expanded)
+    LoadTreeDirectory(path, true)
+  endfor
   LoadTreeGit()
+enddef
+
+def RefreshRemoteTree()
+  ReloadRemoteTree()
 enddef
 
 def CurrentRemoteTreeNode(): dict<any>
@@ -1937,6 +2252,493 @@ def CurrentRemoteTreeNode(): dict<any>
   var nodes = get(b:, 'simpleremote_tree_nodes', [])
   var index = line('.') - 1
   return index >= 0 && index < len(nodes) ? get(nodes, index, {}) : {}
+enddef
+
+def RemoteTreeNodeAtLine(lnum: number): dict<any>
+  var nodes = getbufvar(get(s_tree, 'buf', -1), 'simpleremote_tree_nodes', [])
+  var index = lnum - 1
+  return index >= 0 && index < len(nodes) ? get(nodes, index, {}) : {}
+enddef
+
+def RemoteTreeTargetDirectory(): string
+  var node = CurrentRemoteTreeNode()
+  if empty(node)
+    return get(s_tree, 'root', s_remote.root)
+  endif
+  return get(node, 'type', '') ==# 'd' ? node.path : RemoteParent(node.path)
+enddef
+
+def ValidRemoteRelative(path: string): bool
+  if empty(path) || path =~# '^/' || path =~# "[\r\n\t]"
+    return false
+  endif
+  for part in split(path, '/', 1)
+    if empty(part) || part ==# '.' || part ==# '..'
+      return false
+    endif
+  endfor
+  return true
+enddef
+
+def RemoteTreeMutationFinished(generation: number, label: string,
+    focus: string, open_after: bool, ok: bool, body: string)
+  if !IsCurrent(generation)
+    return
+  endif
+  if !ok
+    Error('[SimpleRemote] ' .. label .. ' failed: ' .. trim(body))
+    return
+  endif
+  var tree_open = !empty(s_tree) && bufexists(get(s_tree, 'buf', -1))
+  if tree_open
+    if !empty(focus)
+      s_tree.reveal = focus
+    endif
+    ReloadRemoteTree()
+  endif
+  echomsg '[SimpleRemote] ' .. label .. ': ' .. focus
+  if open_after
+    var source_win = get(s_tree, 'source_win', 0)
+    if source_win > 0 && win_id2win(source_win) > 0
+      win_gotoid(source_win)
+    endif
+    OpenRemote(focus)
+  endif
+enddef
+
+def RemoteTreeNew(directory: bool)
+  var parent = RemoteTreeTargetDirectory()
+  var relative = input(directory ? 'New remote folder: ' : 'New remote file: ')
+  if empty(relative)
+    return
+  endif
+  if !ValidRemoteRelative(relative)
+    Error('[SimpleRemote] use a relative path without . or .. components')
+    return
+  endif
+  var target = JoinRemotePath(parent, relative)
+  var quoted = shellescape(target)
+  var target_parent = shellescape(RemoteParent(target))
+  var command = 'if [ -e ' .. quoted .. ' ] || [ -L ' .. quoted
+    .. ' ]; then printf "already exists: %s\\n" ' .. quoted
+    .. ' >&2; exit 47; fi; mkdir -p ' .. target_parent
+    .. (directory ? ' && mkdir ' .. quoted : ' && : > ' .. quoted)
+  var generation = s_remote.generation
+  Send('exec', command, (ok, body) => RemoteTreeMutationFinished(
+    generation, directory ? 'created folder' : 'created file',
+    target, !directory, ok, body))
+enddef
+
+def RewriteRemotePath(path: string, source: string, target: string): string
+  return path ==# source ? target
+    : UnderRoot(path, source) ? target .. strpart(path, len(source)) : path
+enddef
+
+def RetargetRemoteBuffers(source: string, target: string)
+  for info in getbufinfo()
+    var remote = getbufvar(info.bufnr, 'vimrc_remote', {})
+    var path = type(remote) == v:t_dict ? get(remote, 'path', '') : ''
+    if get(remote, 'generation', -1) != s_remote.generation
+          || (path !=# source && !UnderRoot(path, source))
+      continue
+    endif
+    var updated = RewriteRemotePath(path, source, target)
+    remote.path = updated
+    remote.uri = 'remote://' .. updated
+    setbufvar(info.bufnr, 'vimrc_remote', remote)
+    setbufvar(info.bufnr, 'simpleremote_path', updated)
+  endfor
+enddef
+
+def RewriteRemoteTreeMaps(source: string, target: string)
+  LoadTreeBookmarks()
+  var marked: dict<any> = {}
+  for [path, kind] in items(get(s_tree, 'marked', {}))
+    marked[RewriteRemotePath(path, source, target)] = kind
+  endfor
+  s_tree.marked = marked
+  var expanded: dict<bool> = {}
+  for path in keys(get(s_tree, 'expanded', {}))
+    expanded[RewriteRemotePath(path, source, target)] = true
+  endfor
+  s_tree.expanded = expanded
+  for [key, node] in items(copy(s_tree_bookmarks))
+    if get(node, 'kind', '') ==# s_remote.kind
+          && get(node, 'target', '') ==# s_remote.target
+          && (node.path ==# source || UnderRoot(node.path, source))
+      remove(s_tree_bookmarks, key)
+      node.path = RewriteRemotePath(node.path, source, target)
+      node.name = fnamemodify(node.path, ':t')
+      s_tree_bookmarks[TreeBookmarkKey(node.path)] = node
+    endif
+  endfor
+  SaveTreeBookmarks()
+enddef
+
+def RemoteTreeRename()
+  var node = CurrentRemoteTreeNode()
+  if empty(node)
+    return
+  endif
+  if node.path ==# s_tree.root
+    Error('[SimpleRemote] refusing to rename the tree root')
+    return
+  endif
+  var name = input('Rename remote node: ', node.name)
+  if empty(name) || name ==# node.name
+    return
+  endif
+  if !ValidRemoteRelative(name) || name =~# '/'
+    Error('[SimpleRemote] the new name must be one path component')
+    return
+  endif
+  var source = node.path
+  var target = JoinRemotePath(RemoteParent(source), name)
+  var quoted_target = shellescape(target)
+  var command = 'if [ -e ' .. quoted_target .. ' ] || [ -L '
+    .. quoted_target .. ' ]; then printf "already exists: %s\\n" '
+    .. quoted_target .. ' >&2; exit 47; fi; mv ' .. shellescape(source)
+    .. ' ' .. quoted_target
+  var generation = s_remote.generation
+  Send('exec', command, (ok, body) => {
+    if ok && IsCurrent(generation)
+      RetargetRemoteBuffers(source, target)
+      RewriteRemoteTreeMaps(source, target)
+    endif
+    RemoteTreeMutationFinished(generation, 'renamed', target, false, ok, body)
+  })
+enddef
+
+def RemoteTreeActionNodes(): list<dict<any>>
+  var result: list<dict<any>> = []
+  var marked = get(s_tree, 'marked', {})
+  if !empty(marked)
+    for path in sort(keys(marked))
+      var covered = false
+      for parent in result
+        if parent.type ==# 'd' && UnderRoot(path, parent.path)
+          covered = true
+          break
+        endif
+      endfor
+      if covered
+        continue
+      endif
+      add(result, {path: path, name: fnamemodify(path, ':t'), type: marked[path]})
+    endfor
+    return result
+  endif
+  var node = CurrentRemoteTreeNode()
+  return empty(node) ? result : [node]
+enddef
+
+def RemoteTreeMarkToggle()
+  var node = CurrentRemoteTreeNode()
+  if empty(node)
+    return
+  endif
+  if has_key(s_tree.marked, node.path)
+    remove(s_tree.marked, node.path)
+  else
+    s_tree.marked[node.path] = node.type
+  endif
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def RemoteTreeMarkRange(first: number, last: number)
+  for lnum in range(min([first, last]), max([first, last]))
+    var node = RemoteTreeNodeAtLine(lnum)
+    if !empty(node)
+      s_tree.marked[node.path] = node.type
+    endif
+  endfor
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def RemoteTreeMarkSiblings()
+  var current = CurrentRemoteTreeNode()
+  if empty(current)
+    return
+  endif
+  for node in getbufvar(s_tree.buf, 'simpleremote_tree_nodes', [])
+    if !empty(node) && get(node, 'parent', '') ==# get(current, 'parent', '')
+      s_tree.marked[node.path] = node.type
+    endif
+  endfor
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def RemoteTreeMarkClear()
+  s_tree.marked = {}
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def RemoteTreeClipboard(mode: string)
+  var nodes = RemoteTreeActionNodes()
+  if empty(nodes)
+    return
+  endif
+  if mode ==# 'cut'
+    for node in nodes
+      if node.path ==# s_tree.root
+        Error('[SimpleRemote] refusing to cut the tree root')
+        return
+      endif
+    endfor
+  endif
+  var clipboard_items: list<dict<any>> = []
+  for node in nodes
+    add(clipboard_items, {path: node.path, type: node.type})
+  endfor
+  s_tree_clipboard = {
+    mode: mode,
+    kind: s_remote.kind,
+    target: s_remote.target,
+    items: clipboard_items,
+  }
+  echomsg printf('[SimpleRemote] %s %d remote node%s',
+    mode ==# 'cut' ? 'cut' : 'copied', len(nodes), len(nodes) == 1 ? '' : 's')
+enddef
+
+def RemoteTreePaste()
+  if empty(s_tree_clipboard)
+    echomsg '[SimpleRemote] remote clipboard is empty'
+    return
+  endif
+  if get(s_tree_clipboard, 'kind', '') !=# s_remote.kind
+        || get(s_tree_clipboard, 'target', '') !=# s_remote.target
+    Error('[SimpleRemote] remote clipboard belongs to another target')
+    return
+  endif
+  var destination = RemoteTreeTargetDirectory()
+  var mode = get(s_tree_clipboard, 'mode', 'copy')
+  var checks: list<string> = []
+  var operations: list<string> = []
+  for item in get(s_tree_clipboard, 'items', [])
+    var source = item.path
+    var target = JoinRemotePath(destination, fnamemodify(source, ':t'))
+    if get(item, 'type', '') ==# 'd' && UnderRoot(target, source)
+      Error('[SimpleRemote] cannot paste a directory into itself: ' .. source)
+      return
+    endif
+    var quoted_target = shellescape(target)
+    add(checks, 'if [ -e ' .. quoted_target .. ' ] || [ -L '
+      .. quoted_target .. ' ]; then printf "already exists: %s\\n" '
+      .. quoted_target .. ' >&2; exit 47; fi')
+    add(operations, (mode ==# 'cut' ? 'mv ' : 'cp -RP ')
+      .. shellescape(source) .. ' ' .. quoted_target)
+  endfor
+  var generation = s_remote.generation
+  Send('exec', join(['set -e'] + checks + operations, '; '), (ok, body) => {
+    if ok && IsCurrent(generation) && mode ==# 'cut'
+      for item in get(s_tree_clipboard, 'items', [])
+        var moved = JoinRemotePath(destination, fnamemodify(item.path, ':t'))
+        RetargetRemoteBuffers(item.path, moved)
+        RewriteRemoteTreeMaps(item.path, moved)
+      endfor
+      s_tree_clipboard = {}
+      s_tree.marked = {}
+    endif
+    RemoteTreeMutationFinished(generation,
+      mode ==# 'cut' ? 'moved' : 'pasted', destination, false, ok, body)
+  })
+enddef
+
+def ModifiedRemoteBufferUnder(root: string): string
+  for info in getbufinfo()
+    if !get(info, 'changed', 0)
+      continue
+    endif
+    var remote = getbufvar(info.bufnr, 'vimrc_remote', {})
+    var path = type(remote) == v:t_dict ? get(remote, 'path', '') : ''
+    if get(remote, 'generation', -1) == s_remote.generation
+          && (path ==# root || UnderRoot(path, root))
+      return path
+    endif
+  endfor
+  return ''
+enddef
+
+def RemoteTreeDelete()
+  var nodes = RemoteTreeActionNodes()
+  if empty(nodes)
+    return
+  endif
+  for node in nodes
+    if node.path ==# s_tree.root
+      Error('[SimpleRemote] refusing to delete the tree root')
+      return
+    endif
+    var modified = ModifiedRemoteBufferUnder(node.path)
+    if !empty(modified)
+      Error('[SimpleRemote] refusing to delete a modified remote buffer: ' .. modified)
+      return
+    endif
+  endfor
+  var label = len(nodes) == 1 ? nodes[0].path : printf('%d marked nodes', len(nodes))
+  if confirm('Delete remote ' .. label .. '?', "&Delete\n&Cancel", 2) != 1
+    return
+  endif
+  var commands = ['set -e']
+  for node in nodes
+    add(commands, 'rm -rf ' .. shellescape(node.path))
+  endfor
+  var generation = s_remote.generation
+  Send('exec', join(commands, '; '), (ok, body) => {
+    if ok && IsCurrent(generation)
+      s_tree.marked = {}
+      LoadTreeBookmarks()
+      for node in nodes
+        for path in keys(copy(s_tree.expanded))
+          if path ==# node.path || UnderRoot(path, node.path)
+            remove(s_tree.expanded, path)
+          endif
+        endfor
+        for [key, bookmark] in items(copy(s_tree_bookmarks))
+          if bookmark.path ==# node.path || UnderRoot(bookmark.path, node.path)
+            remove(s_tree_bookmarks, key)
+          endif
+        endfor
+      endfor
+      SaveTreeBookmarks()
+    endif
+    RemoteTreeMutationFinished(generation, 'deleted', label, false, ok, body)
+  })
+enddef
+
+def TreeBookmarkKey(path: string): string
+  return s_remote.kind .. "\t" .. s_remote.target .. "\t" .. path
+enddef
+
+def TreeBookmarksFile(): string
+  var configured = expand(get(g:, 'simpleremote_tree_bookmarks_file', ''))
+  return !empty(configured) ? configured
+    : ProjectionStateDir() .. '/tree-bookmarks.json'
+enddef
+
+def LoadTreeBookmarks()
+  if s_tree_bookmarks_loaded
+    return
+  endif
+  s_tree_bookmarks_loaded = true
+  var file = TreeBookmarksFile()
+  if !filereadable(file)
+    return
+  endif
+  try
+    var decoded = json_decode(join(readfile(file), "\n"))
+    if type(decoded) == v:t_dict
+      s_tree_bookmarks = decoded
+    endif
+  catch
+    Error('[SimpleRemote] invalid tree bookmarks: ' .. v:exception)
+  endtry
+enddef
+
+def SaveTreeBookmarks()
+  var file = TreeBookmarksFile()
+  if !EnsurePrivateDir(fnamemodify(file, ':h'))
+    Error('[SimpleRemote] cannot create tree bookmark directory')
+    return
+  endif
+  var temporary = file .. '.tmp.' .. getpid()
+  try
+    writefile([json_encode(s_tree_bookmarks)], temporary)
+    if rename(temporary, file) != 0
+      delete(temporary)
+      Error('[SimpleRemote] cannot save tree bookmarks')
+    endif
+  catch
+    delete(temporary)
+    Error('[SimpleRemote] cannot save tree bookmarks: ' .. v:exception)
+  endtry
+enddef
+
+def TreeBookmarked(path: string): bool
+  LoadTreeBookmarks()
+  return has_key(s_tree_bookmarks, TreeBookmarkKey(path))
+enddef
+
+def RemoteTreeBookmarkToggle()
+  LoadTreeBookmarks()
+  var node = CurrentRemoteTreeNode()
+  if empty(node)
+    return
+  endif
+  var key = TreeBookmarkKey(node.path)
+  if has_key(s_tree_bookmarks, key)
+    remove(s_tree_bookmarks, key)
+  else
+    s_tree_bookmarks[key] = {
+      kind: s_remote.kind,
+      target: s_remote.target,
+      path: node.path,
+      name: node.name,
+      type: node.type,
+    }
+  endif
+  SaveTreeBookmarks()
+  RenderRemoteTree(s_tree.buf)
+enddef
+
+def RemoteTreeBookmarkNodes(): list<dict<any>>
+  LoadTreeBookmarks()
+  var result: list<dict<any>> = []
+  for node in values(s_tree_bookmarks)
+    if node.kind ==# s_remote.kind && node.target ==# s_remote.target
+      add(result, node)
+    endif
+  endfor
+  sort(result, (a, b) => TreeTextCompare(a.path, b.path))
+  return result
+enddef
+
+def OpenRemoteTreeBookmark(nodes: list<dict<any>>, result: number)
+  if result <= 0 || result > len(nodes)
+    return
+  endif
+  var node = nodes[result - 1]
+  if node.type ==# 'd'
+    SetRemoteTreeRoot(RemoteParent(node.path), false)
+    OpenRemoteTree(RemoteParent(node.path), node.path)
+  else
+    OpenRemote(node.path)
+  endif
+enddef
+
+def RemoteTreeBookmarkList()
+  var nodes = RemoteTreeBookmarkNodes()
+  if empty(nodes)
+    echomsg '[SimpleRemote] no remote bookmarks for this target'
+    return
+  endif
+  var labels = mapnew(nodes, (_, node) =>
+    (node.type ==# 'd' ? '[dir] ' : '      ') .. node.path)
+  if exists('*popup_menu') == 1
+    popup_menu(labels, {
+      title: ' SimpleRemote bookmarks ',
+      callback: (_id, result) => OpenRemoteTreeBookmark(nodes, result),
+      maxheight: min([18, &lines - 4]),
+      minwidth: min([72, &columns - 4]),
+    })
+  else
+    OpenRemoteTreeBookmark(nodes, inputlist(['Remote bookmarks:'] + labels))
+  endif
+enddef
+
+def RemoteTreeBookmarkCycle(direction: number)
+  var nodes = getbufvar(s_tree.buf, 'simpleremote_tree_nodes', [])
+  var current = line('.') - 1
+  var total = len(nodes)
+  for step in range(1, total)
+    var index = (current + direction * step + total * 2) % total
+    var node = get(nodes, index, {})
+    if !empty(node) && TreeBookmarked(node.path)
+      cursor(index + 1, 1)
+      return
+    endif
+  endfor
+  echomsg '[SimpleRemote] no other visible bookmark'
 enddef
 
 def CopyText(text: string): bool
@@ -2145,7 +2947,6 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> l <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
   nnoremap <silent><buffer> <Right> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
   nnoremap <silent><buffer> <2-LeftMouse> <Cmd>call g:SimpleRemoteTreeActivate('edit')<CR>
-  nnoremap <silent><buffer> s <Cmd>call g:SimpleRemoteTreeActivate('split')<CR>
   nnoremap <silent><buffer> S <Cmd>call g:SimpleRemoteTreeActivate('split')<CR>
   nnoremap <silent><buffer> v <Cmd>call g:SimpleRemoteTreeActivate('vsplit')<CR>
   nnoremap <silent><buffer> V <Cmd>call g:SimpleRemoteTreeActivate('vsplit')<CR>
@@ -2157,10 +2958,13 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> h <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <Left> <Cmd>call g:SimpleRemoteTreeParent()<CR>
   nnoremap <silent><buffer> <BS> <Cmd>call g:SimpleRemoteTreeParent()<CR>
-  nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
   nnoremap <silent><buffer> R <Cmd>call g:SimpleRemoteTreeRefresh()<CR>
   nnoremap <silent><buffer> H <Cmd>call g:SimpleRemoteTreeToggleHidden()<CR>
+  nnoremap <silent><buffer> I <Cmd>call g:SimpleRemoteTreeToggleGitIgnore()<CR>
+  nnoremap <silent><buffer> s <Cmd>call g:SimpleRemoteTreeSortCycle()<CR>
+  nnoremap <silent><buffer> gs <Cmd>call g:SimpleRemoteTreeSortReverse()<CR>
   nnoremap <silent><buffer> z <Cmd>call g:SimpleRemoteTreeCollapseAll()<CR>
+  nnoremap <silent><buffer> F <Cmd>call g:SimpleRemoteTreeFilter()<CR>
   nnoremap <silent><buffer> f <Cmd>call g:SimpleRemoteTreeRevealActive()<CR>
   nnoremap <silent><buffer> / <Cmd>call g:SimpleRemoteTreeFind(1, 1)<CR>
   nnoremap <silent><buffer> ]f <Cmd>call g:SimpleRemoteTreeFind(0, 1)<CR>
@@ -2169,11 +2973,30 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> U <Cmd>call g:SimpleRemoteTreeRootUp()<CR>
   nnoremap <silent><buffer> C <Cmd>call g:SimpleRemoteTreeRootPrompt()<CR>
   nnoremap <silent><buffer> . <Cmd>call g:SimpleRemoteTreeRootReset()<CR>
+  nnoremap <silent><buffer> d <Cmd>call g:SimpleRemoteTreeRootCurrent()<CR>
+  nnoremap <silent><buffer> L <Cmd>call g:SimpleRemoteTreeToggleRootLock()<CR>
   nnoremap <silent><buffer> ? <Cmd>call g:SimpleRemoteTreeHelp()<CR>
+  nnoremap <silent><buffer> c <Cmd>call g:SimpleRemoteTreeCopy()<CR>
+  nnoremap <silent><buffer> x <Cmd>call g:SimpleRemoteTreeCut()<CR>
+  nnoremap <silent><buffer> p <Cmd>call g:SimpleRemoteTreePaste()<CR>
+  nnoremap <silent><buffer> a <Cmd>call g:SimpleRemoteTreeNewFile()<CR>
+  nnoremap <silent><buffer> n <Cmd>call g:SimpleRemoteTreeNewFile()<CR>
+  nnoremap <silent><buffer> A <Cmd>call g:SimpleRemoteTreeNewFolder()<CR>
+  nnoremap <silent><buffer> N <Cmd>call g:SimpleRemoteTreeNewFolder()<CR>
+  nnoremap <silent><buffer> r <Cmd>call g:SimpleRemoteTreeRename()<CR>
+  nnoremap <silent><buffer> D <Cmd>call g:SimpleRemoteTreeDelete()<CR>
+  nnoremap <silent><buffer> <Space> <Cmd>call g:SimpleRemoteTreeMarkToggle()<CR>
+  xnoremap <silent><buffer> <Space> :<C-u>call g:SimpleRemoteTreeMarkRange(line("'<"), line("'>"))<CR>
+  nnoremap <silent><buffer> gm <Cmd>call g:SimpleRemoteTreeMarkSiblings()<CR>
+  nnoremap <silent><buffer> gM <Cmd>call g:SimpleRemoteTreeMarkClear()<CR>
+  nnoremap <silent><buffer> m <Cmd>call g:SimpleRemoteTreeBookmarkToggle()<CR>
+  nnoremap <silent><buffer> ' <Cmd>call g:SimpleRemoteTreeBookmarkList()<CR>
+  nnoremap <silent><buffer> ]b <Cmd>call g:SimpleRemoteTreeBookmarkCycle(1)<CR>
+  nnoremap <silent><buffer> [b <Cmd>call g:SimpleRemoteTreeBookmarkCycle(-1)<CR>
   nnoremap <silent><buffer> y <Cmd>call g:SimpleRemoteTreeYank(0)<CR>
   nnoremap <silent><buffer> Y <Cmd>call g:SimpleRemoteTreeYank(1)<CR>
   nnoremap <silent><buffer> gy <Cmd>call g:SimpleRemoteTreeCopyContents()<CR>
-  nnoremap <silent><buffer> c <Cmd>call g:SimpleRemoteTreeCopyOut()<CR>
+  nnoremap <silent><buffer> gd <Cmd>call g:SimpleRemoteTreeCopyOut()<CR>
   s_tree = {
     buf: buf,
     source_win: source_win,
@@ -2184,8 +3007,16 @@ def OpenRemoteTree(path: string, reveal: string = '')
     loading: {},
     errors: {},
     git: {},
+    git_ignored: {},
+    git_ignore: !!get(g:, 'simpleremote_tree_git_ignore', 1),
     expanded: {path: true},
     find_query: '',
+    filter_query: '',
+    marked: {},
+    sort: get(g:, 'simpleremote_tree_sort', 'name'),
+    sort_reverse: !!get(g:, 'simpleremote_tree_sort_reverse', 0),
+    metadata_supported: -1,
+    root_locked: !!get(g:, 'simpleremote_tree_root_locked', 1),
   }
   LoadRemoteTree(path)
 enddef
@@ -2209,8 +3040,7 @@ def OpenWorkspaceTree()
     var local_tree_root = RemoteTreeLocalPath(remote_tree_root)
     CloseRemoteTree()
     if exists(':SimpleTree') == 2
-      if SimpleTreeVisible() && exists('*simpletree#ExternalSetRoot') == 1
-            && simpletree#ExternalSetRoot(local_tree_root)
+      if SimpleTreeVisible() && SetSimpleTreeRoot(local_tree_root)
         return
       endif
       execute 'SimpleTree ' .. fnameescape(local_tree_root)
@@ -2487,6 +3317,22 @@ def g:SimpleRemoteTreeToggleHidden()
   RemoteTreeToggleHidden()
 enddef
 
+def g:SimpleRemoteTreeToggleGitIgnore()
+  RemoteTreeToggleGitIgnore()
+enddef
+
+def g:SimpleRemoteTreeFilter()
+  RemoteTreeFilter()
+enddef
+
+def g:SimpleRemoteTreeSortCycle()
+  RemoteTreeSortCycle()
+enddef
+
+def g:SimpleRemoteTreeSortReverse()
+  RemoteTreeSortReverse()
+enddef
+
 def g:SimpleRemoteTreeCollapseAll()
   RemoteTreeCollapseAll()
 enddef
@@ -2499,6 +3345,14 @@ def g:SimpleRemoteTreeRevealActive()
   RemoteTreeRevealActive()
 enddef
 
+def g:SimpleRemoteTreeRootCurrent()
+  RemoteTreeRootCurrent()
+enddef
+
+def g:SimpleRemoteTreeToggleRootLock()
+  RemoteTreeToggleRootLock()
+enddef
+
 def g:SimpleRemoteTreeSetRoot(path: string): bool
   return SetRemoteTreeRoot(path)
 enddef
@@ -2508,14 +3362,35 @@ def g:SimpleRemoteOnSimpleTreeRootChanged()
     return
   endif
   var event = get(g:, 'simpletree_event', {})
-  var local = type(event) == v:t_dict ? get(event, 'path', '') : ''
-  if empty(local) || !UnderRoot(local, s_remote.local_root)
+  if type(event) != v:t_dict || get(event, 'source', '') ==# 'simpleremote'
     return
   endif
-  var suffix = strpart(local, len(s_remote.local_root))
-  var remote = s_remote.root ==# '/'
-    ? '/' .. substitute(suffix, '^/', '', '') : s_remote.root .. suffix
-  SetRemoteTreeRoot(remote, false)
+  var local = get(event, 'root', get(event, 'path', ''))
+  if empty(local)
+    return
+  endif
+  local = substitute(resolve(fnamemodify(local, ':p')), '[\\/]\+$', '', '')
+  if UnderRoot(local, s_remote.local_root)
+    var suffix = strpart(local, len(s_remote.local_root))
+    var remote = s_remote.root ==# '/'
+      ? '/' .. substitute(suffix, '^/', '', '') : s_remote.root .. suffix
+    QueueWorkspaceRoot(remote, local, 'simpletree')
+    return
+  endif
+
+  # `U` from the projection root lands briefly in the mountpoint's local
+  # parent.  Its lexical path is not a projection, but the event carries enough
+  # intent to move the remote workspace up and let projection discovery mount
+  # the corresponding directory.
+  var old_local = get(event, 'old_root', '')
+  if get(event, 'source', '') ==# 'up' && !empty(old_local)
+    old_local = substitute(resolve(fnamemodify(old_local, ':p')),
+      '[\\/]\+$', '', '')
+    if old_local ==# substitute(s_remote.local_root, '[\\/]\+$', '', '')
+          && local ==# fnamemodify(old_local, ':h')
+      QueueWorkspaceRoot(RemoteParent(s_remote.root), local, 'simpletree')
+    endif
+  endif
 enddef
 
 def g:SimpleRemoteTreeYank(absolute: number)
@@ -2524,6 +3399,62 @@ enddef
 
 def g:SimpleRemoteTreeCopyContents()
   CopyRemoteTreeContents()
+enddef
+
+def g:SimpleRemoteTreeCopy()
+  RemoteTreeClipboard('copy')
+enddef
+
+def g:SimpleRemoteTreeCut()
+  RemoteTreeClipboard('cut')
+enddef
+
+def g:SimpleRemoteTreePaste()
+  RemoteTreePaste()
+enddef
+
+def g:SimpleRemoteTreeNewFile()
+  RemoteTreeNew(false)
+enddef
+
+def g:SimpleRemoteTreeNewFolder()
+  RemoteTreeNew(true)
+enddef
+
+def g:SimpleRemoteTreeRename()
+  RemoteTreeRename()
+enddef
+
+def g:SimpleRemoteTreeDelete()
+  RemoteTreeDelete()
+enddef
+
+def g:SimpleRemoteTreeMarkToggle()
+  RemoteTreeMarkToggle()
+enddef
+
+def g:SimpleRemoteTreeMarkRange(first: number, last: number)
+  RemoteTreeMarkRange(first, last)
+enddef
+
+def g:SimpleRemoteTreeMarkSiblings()
+  RemoteTreeMarkSiblings()
+enddef
+
+def g:SimpleRemoteTreeMarkClear()
+  RemoteTreeMarkClear()
+enddef
+
+def g:SimpleRemoteTreeBookmarkToggle()
+  RemoteTreeBookmarkToggle()
+enddef
+
+def g:SimpleRemoteTreeBookmarkList()
+  RemoteTreeBookmarkList()
+enddef
+
+def g:SimpleRemoteTreeBookmarkCycle(direction: number)
+  RemoteTreeBookmarkCycle(direction)
 enddef
 
 def g:SimpleRemoteTreeCopyOut()
@@ -2539,6 +3470,23 @@ def g:SimpleRemoteTreeStatusline(): string
   var flags: list<string> = []
   if !get(g:, 'simpleremote_tree_show_hidden', 1)
     add(flags, 'hidden:off')
+  endif
+  if !get(s_tree, 'git_ignore', true)
+    add(flags, 'gitignore:off')
+  endif
+  if get(s_tree, 'root_locked', false)
+    add(flags, 'locked')
+  endif
+  var filter_query = get(s_tree, 'filter_query', '')
+  if !empty(filter_query)
+    add(flags, 'filter:' .. filter_query)
+  endif
+  var sort = TreeSortMode()
+  if sort !=# 'name' || get(s_tree, 'sort_reverse', false)
+    add(flags, 'sort:' .. sort .. (get(s_tree, 'sort_reverse', false) ? ':rev' : ''))
+  endif
+  if !empty(get(s_tree, 'marked', {}))
+    add(flags, 'marked:' .. len(s_tree.marked))
   endif
   var query = get(s_tree, 'find_query', '')
   if !empty(query)

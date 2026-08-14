@@ -41,8 +41,8 @@ functions cannot be made transparent in virtual mode.
 :SimpleRemoteWorkspace [dir]  Open the workspace tree or reconnect at {dir}.
 :SimpleRemoteTree             Toggle SimpleTree/projected tree or the rich
                               asynchronous virtual tree.  In virtual mode,
-                              <CR>/l expands or opens, h collapses, r refreshes,
-                              and s/v/t open files in split/vsplit/tab.
+                              <CR>/l expands or opens, h collapses, R refreshes,
+                              and S/V/t open files in split/vsplit/tab.
 :SimpleRemoteTreeReveal       Reveal the current local or remote file.
 :SimpleRemoteOpen {path}      Open a remote path relative to the workspace.
 :SimpleRemoteExec {command}   Execute in the remote workspace root.
@@ -75,13 +75,21 @@ Options:
   g:simpleremote_use_sshfs            'auto', 'never', 1, or 0
   g:simpleremote_change_directory     'tab', 'global', or 'none'
   g:simpleremote_open_tree_on_connect 1 to open the tree after connecting
+  g:simpleremote_sync_tree_root       1 to follow SimpleTree root changes
   g:simpleremote_default_root         root used by the target picker
   g:simpleremote_tree_width           virtual tree width
   g:simpleremote_tree_use_nerdfont    use Nerd Font icons (inherits SimpleTree)
   g:simpleremote_tree_show_file_icons show file-type icons
   g:simpleremote_tree_show_git_status show right-aligned Git badges
   g:simpleremote_tree_show_hidden     include dotfiles
+  g:simpleremote_tree_git_ignore      hide Git-ignored paths
   g:simpleremote_tree_ignore          names/globs hidden from the virtual tree
+  g:simpleremote_tree_sort            name, extension, mtime, or size
+  g:simpleremote_tree_sort_reverse    reverse each file/directory sort group
+  g:simpleremote_tree_root_locked     protect the current tree/workspace root
+  g:simpleremote_tree_mark_symbol     marked-node display symbol
+  g:simpleremote_tree_bookmark_symbol bookmarked-node display symbol
+  g:simpleremote_tree_bookmarks_file  local persistent bookmark JSON path
   g:simpleremote_local_roots          explicit target/root to local mappings
   g:simpleremote_agent                remote agent path
 
@@ -97,8 +105,10 @@ behave like a native workspace.  Remote builds and shells should still use
 
 "virtual" uses remote:// buffers.  Reads and writes are asynchronous and tied
 to the originating buffer/generation.  The built-in tree supports navigation,
-refresh, edit, split, vsplit, and tabedit.  Buffer-content plugins work; local
-filesystem daemons require a projection or explicit SimpleRemote integration.
+editing, remote filesystem mutations, marks, bookmarks, sorting, filtering,
+Git badges, split/vsplit/tabedit, and workspace-root changes.  Buffer-content
+plugins work; local filesystem daemons require a projection or explicit
+SimpleRemote integration.
 
 Events expose their payload in g:simpleremote_event:
 
@@ -155,43 +165,71 @@ TREE COPY INTEGRATION                          *simpleremote-tree-copy*
 
 In the virtual remote tree:
 
-  c     Download the selected file to SimpleTree's selected local directory.
+  c/x   Copy/cut the current remote node, or every marked node.
+  p     Paste into the selected directory.  Directories copy recursively.
+  gd    Download the selected file to SimpleTree's selected local directory.
         Without a local SimpleTree root, prompt for the destination.
   y     Copy the remote file name.
   Y     Copy the absolute remote path.
   gy    Copy the remote text file contents.
 
+Remote paste refuses existing destinations and preflights the complete batch
+before changing anything.  Copy/cut state is scoped to its SSH host or Docker
+container.  Text and local-download paths use SimpleClipboard when available.
+
 The Rust "download" action streams bytes into a same-directory temporary file
 and atomically activates it.  It never loads the complete file into Vim.
-SimpleClipboard is used when available; fallback keeps text in the unnamed
-register.  A completed download emits SimpleRemoteFileCopied and refreshes
-SimpleTree.
+Fallback keeps text in the unnamed register.  A completed download emits
+SimpleRemoteFileCopied and refreshes SimpleTree.
 
 g:simpleremote_copy_destination        string  default: empty
-        Fixed local directory for c.  Empty asks SimpleTree for its selected
+        Fixed local directory for gd.  Empty asks SimpleTree for its selected
         directory/root and prompts only when no local tree is available.
 
 g:simpleremote_copy_prompt              number  default: 0
-        Prompt for every c destination, prefilled with the integrated target.
+        Prompt for every gd destination, prefilled with the integrated target.
 
 g:simpleremote_clipboard_max_bytes      number  default: 1048576
         Maximum remote text size accepted by gy.  Zero disables the limit.
 
 TREE ROOT INTEGRATION                           *simpleremote-tree-root*
 
-  e     Use the selected remote directory (or file parent) as the tree root.
-  U     Move the tree root to its parent, up to the remote filesystem root.
-  C     Prompt for any absolute remote directory.
-  .     Restore the connected workspace root.
+  e     Use the selected remote directory (or file parent) as the workspace.
+  U     Move the workspace to its parent, up to the remote filesystem root.
+  C     Prompt for any absolute remote workspace.
+  .     Restore a view-only reveal to the connected workspace root.
+  d     Use the active remote file's directory as the workspace root.
+  L     Toggle protection for root-changing actions.
   ?     Open the complete remote-tree key reference popup.
 
-The virtual tree also accepts SimpleTree-compatible navigation aliases:
-o/Right, Left, S/V/t, CTRL-X/CTRL-V/CTRL-T, P preview, H hidden files,
-z collapse all, f reveal active, / find, and ]f/[f find cycling.
+The virtual tree accepts the SimpleTree-compatible action surface:
+
+  <CR>/o/Right        expand a directory or edit a file
+  h/Left/BS           collapse the current node or nearest expanded ancestor
+  S/V/t               split, vertical split, or tab edit
+  CTRL-X/CTRL-V/CTRL-T equivalent split actions
+  P                   preview while retaining tree focus
+  R/H/I               refresh, hidden toggle, Git-ignore toggle
+  s/gs                cycle sort mode / reverse the current sort
+  F                   filter already loaded tree nodes (empty clears)
+  z/f                 collapse all / reveal the active remote file
+  /, ]f, [f           find visible nodes and cycle matches
+  a/n, A/N, r, D      new file, new directory, rename, delete
+  c/x/p               remote copy, cut, paste
+  Space, gm, gM       toggle/range mark, mark siblings, clear marks
+  m, ', ]b, [b        bookmark, list bookmarks, cycle visible bookmarks
+  y/Y/gy/gd           copy name/path/content or download to the local tree
+
+All keys in SimpleTree's built-in help panel have a virtual-tree counterpart
+except gx: a remote path has no dependable local system-default application.
+Modification-time and size sorting require the current bundled remote agent;
+run :SimpleRemoteInstallAgent after upgrading an older installation.
 
 *:SimpleRemoteTreeRoot* {path}
-        Set the visible tree root without changing the connection or LSP
-        workspace.  Mounted SimpleTree roots synchronize through
-        SimpleTreeRootChanged and simpletree#ExternalSetRoot().  Browsing
-        outside a workspace-only mount switches to the virtual remote tree;
-        returning inside restores the local SimpleTree projection.
+        Change the connected workspace root.  Projection discovery, tab-local
+        current directory, remote simplecc.json, and SimpleCC restart through
+        the normal reconnect lifecycle.  Mounted SimpleTree roots synchronize
+        in the other direction through SimpleTreeRootChanged; provider-tagged
+        simpletree#ExternalSetRoot() calls do not feed back into another
+        reconnect.  Set g:simpleremote_sync_tree_root to 0 for the historical
+        view-only behavior.

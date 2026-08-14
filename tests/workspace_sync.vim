@@ -1,0 +1,115 @@
+vim9script
+
+set nocompatible
+set nomore
+
+const REPO = $SIMPLEREMOTE_TEST_ROOT
+const TARGET = $SIMPLEREMOTE_TEST_TARGET
+const BASE = tempname()
+const CHILD = BASE .. '/child'
+const OTHER = CHILD .. '/other'
+mkdir(OTHER, 'p')
+writefile(['{"workspace": "base"}'], BASE .. '/simplecc.json')
+writefile(['{"workspace": "child"}'], CHILD .. '/simplecc.json')
+
+g:simpleremote_use_daemon = 0
+g:simpleremote_use_sshfs = 'never'
+g:simpleremote_open_tree_on_connect = 0
+g:simpleremote_change_directory = 'none'
+g:simpleremote_agent = REPO .. '/bin/simpleremote-agent.sh'
+g:simpleremote_local_roots = {}
+g:simpleremote_local_roots['ssh:' .. TARGET .. ':' .. BASE] = BASE
+execute 'set runtimepath^=' .. fnameescape(REPO)
+runtime plugin/simpleremote.vim
+
+def WaitForRoot(root: string, timeout: float = 4.0): bool
+  var started = reltime()
+  while reltimefloat(reltime(started)) < timeout
+    var workspace = get(g:, 'simpleremote_workspace', {})
+    if get(workspace, 'root', '') ==# root
+          && get(g:, 'simpleremote_status', '') ==# 'ssh:' .. TARGET
+      return true
+    endif
+    sleep 10m
+  endwhile
+  return false
+enddef
+
+def WaitForConfig(name: string, timeout: float = 4.0): bool
+  var started = reltime()
+  while reltimefloat(reltime(started)) < timeout
+    if exists('g:vimrc_remote_simplecc_config')
+      try
+        if get(json_decode(g:vimrc_remote_simplecc_config), 'workspace', '') ==# name
+          return true
+        endif
+      catch
+      endtry
+    endif
+    sleep 10m
+  endwhile
+  return false
+enddef
+
+def FireRoot(root: string, old_root: string, source: string)
+  g:simpletree_event = {
+    root: root,
+    path: root,
+    old_root: old_root,
+    source: source,
+  }
+  doautocmd <nomodeline> User SimpleTreeRootChanged
+enddef
+
+def Run()
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitForRoot(BASE), 'initial workspace did not become ready')
+  assert_true(WaitForConfig('base'), 'initial config was not loaded')
+  var first_id = g:simpleremote_workspace.id
+  assert_equal(BASE, g:simpleremote_workspace.local_root)
+
+  # A user re-root inside the projection becomes a real remote workspace.  It
+  # reconnects with the precise local half of an explicit local map.
+  FireRoot(CHILD, BASE, 'here')
+  assert_true(WaitForRoot(CHILD), 'SimpleTree child root was not synchronized')
+  assert_true(WaitForConfig('child'), 'child workspace config was not loaded')
+  assert_notequal(first_id, g:simpleremote_workspace.id)
+  assert_equal(CHILD, g:simpleremote_workspace.local_root)
+  var child_id = g:simpleremote_workspace.id
+
+  # SimpleRemote's own projection echo must never feed a second reconnect.
+  FireRoot(OTHER, CHILD, 'simpleremote')
+  sleep 50m
+  assert_equal(CHILD, g:simpleremote_workspace.root)
+  assert_equal(child_id, g:simpleremote_workspace.id)
+
+  # Root-up carries intent even though the local parent is lexically outside
+  # the current projection root.
+  FireRoot(BASE, CHILD, 'up')
+  assert_true(WaitForRoot(BASE), 'SimpleTree root-up was not synchronized')
+  assert_true(WaitForConfig('base'), 'parent workspace config was not restored')
+  assert_equal(BASE, g:simpleremote_workspace.local_root)
+
+  # The virtual tree's e/U/C path uses the same workspace-switch primitive.
+  assert_true(g:SimpleRemoteTreeSetRoot(CHILD))
+  assert_true(WaitForRoot(CHILD), 'remote-tree root did not switch workspace')
+  assert_true(WaitForConfig('child'), 'remote-tree workspace config was not loaded')
+enddef
+
+var failure = ''
+try
+  Run()
+catch
+  failure = v:exception .. ' @ ' .. v:throwpoint
+finally
+  silent! SimpleRemoteDisconnect
+  delete(BASE, 'rf')
+endtry
+if !empty(failure)
+  add(v:errors, failure)
+endif
+if !empty(v:errors)
+  writefile(v:errors, '/dev/stderr')
+  cquit
+endif
+qall!

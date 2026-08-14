@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${SIMPLEREMOTE_TEST_TARGET:?}"
+
+if [[ $# -ne 5 || $1 != -T || $2 != "$SIMPLEREMOTE_TEST_TARGET" \
+      || $3 != sh || $4 != -c ]]; then
+  printf 'unexpected ssh invocation:' >&2
+  printf ' <%s>' "$@" >&2
+  printf '\n' >&2
+  exit 64
+fi
+
+# OpenSSH joins everything after the target and lets the login shell parse it.
+# Reproduce that boundary locally so the Vim test exercises the real agent.
+remote_command=$(printf '%s ' "${@:3}")
+remote_command=${remote_command% }
+exec sh -c "$remote_command"

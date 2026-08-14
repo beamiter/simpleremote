@@ -25,6 +25,9 @@ endif
 if !exists('g:simpleremote_open_tree_on_connect')
   g:simpleremote_open_tree_on_connect = 1
 endif
+if !exists('g:simpleremote_sync_tree_root')
+  g:simpleremote_sync_tree_root = 1
+endif
 if !exists('g:simpleremote_tree_width')
   g:simpleremote_tree_width = 40
 endif
@@ -39,6 +42,27 @@ if !exists('g:simpleremote_tree_show_git_status')
 endif
 if !exists('g:simpleremote_tree_show_hidden')
   g:simpleremote_tree_show_hidden = 1
+endif
+if !exists('g:simpleremote_tree_git_ignore')
+  g:simpleremote_tree_git_ignore = 1
+endif
+if !exists('g:simpleremote_tree_sort')
+  g:simpleremote_tree_sort = 'name'
+endif
+if !exists('g:simpleremote_tree_sort_reverse')
+  g:simpleremote_tree_sort_reverse = 0
+endif
+if !exists('g:simpleremote_tree_root_locked')
+  g:simpleremote_tree_root_locked = get(g:, 'simpletree_root_locked', 1)
+endif
+if !exists('g:simpleremote_tree_mark_symbol')
+  g:simpleremote_tree_mark_symbol = get(g:, 'simpletree_mark_symbol', '✓')
+endif
+if !exists('g:simpleremote_tree_bookmark_symbol')
+  g:simpleremote_tree_bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
+endif
+if !exists('g:simpleremote_tree_bookmarks_file')
+  g:simpleremote_tree_bookmarks_file = ''
 endif
 if !exists('g:simpleremote_tree_ignore')
   g:simpleremote_tree_ignore = [
