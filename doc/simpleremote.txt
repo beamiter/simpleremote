@@ -129,6 +129,7 @@ Events expose their payload in g:simpleremote_event:
   g:SimpleRemoteRemotePath(local_path)
   g:SimpleRemoteShellCommand(command)
   g:SimpleRemoteReadFile(path, Callback)
+  g:SimpleRemoteTerminalSpec([command])
   g:SimpleRemoteTreeSetRoot(path)
   g:SimpleRemoteStatusline()
 
@@ -148,6 +149,11 @@ workspace without opening a buffer.  Callback is called as (ok,
 content-or-error).  Relative paths use the workspace root; paths outside the
 workspace are rejected.  SimpleFinder uses this API for virtual-workspace
 previews.
+
+SimpleRemoteTerminalSpec() returns the argv, label and workspace metadata for
+an SSH/Docker terminal.  It returns an empty dictionary until a workspace is
+ready.  SimpleTerminal uses this API to provide the same popup/session UI for
+local and remote shells.
 
 SimpleRemoteTreeSetRoot() changes the real workspace when
 g:simpleremote_sync_tree_root is enabled. SimpleTree and SimpleFinder use it

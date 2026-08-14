@@ -79,6 +79,15 @@ def Run()
   var first_id = g:simpleremote_workspace.id
   assert_equal(BASE, g:simpleremote_workspace.local_root)
 
+  var terminal = g:SimpleRemoteTerminalSpec()
+  assert_true(type(terminal) == v:t_dict && !empty(terminal))
+  assert_equal(true, terminal.remote)
+  assert_equal('', terminal.cwd)
+  assert_equal('ssh', terminal.command[0])
+  assert_match(BASE, string(terminal.command))
+  terminal = g:SimpleRemoteTerminalSpec('printf ready')
+  assert_match('printf ready', string(terminal.command))
+
   # Finder previews use the public asynchronous reader rather than opening a
   # temporary remote buffer for every selected result.
   var read_done = false

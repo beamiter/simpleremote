@@ -44,6 +44,13 @@ Workspace changes refresh a live finder panel, while `:SimpleFinderRoot`
 switches the real SimpleRemote workspace in the other direction. Set
 `g:simplefinder_remote = 0` to opt out.
 
+## SimpleTerminal integration
+
+`g:SimpleRemoteTerminalSpec([command])` exposes an argv-based SSH/Docker
+terminal specification for the active workspace. SimpleTerminal consumes it
+so local and remote shells share one popup/session UI. When SimpleTerminal is
+installed, `:SimpleRemoteTerminal` delegates to that UI automatically.
+
 ## Runtime probe and remote environment
 
 `simpleremote-daemon probe` reuses the SSH ControlMaster connection to report

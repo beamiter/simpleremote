@@ -616,6 +616,13 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
   setbufvar(buf, '&modified', 0)
   MaybeStartSimpleCC(buf)
   DetectRemoteFiletype(buf)
+  g:simpleremote_event = {
+    type: 'buffer-read',
+    bufnr: buf,
+    path: remote_path,
+    workspace: copy(get(g:, 'simpleremote_workspace', {})),
+  }
+  silent! doautocmd <nomodeline> User SimpleRemoteBufferRead
 enddef
 
 def ReadRemote(uri: string)
@@ -3502,24 +3509,48 @@ def g:SimpleRemoteTreeStatusline(): string
     get(b:, 'simpleremote_tree_path', s_remote.root), detail)
 enddef
 
+def g:SimpleRemoteTerminalSpec(argument: string = ''): dict<any>
+  if !IsReady()
+    return {}
+  endif
+  var command: list<string>
+  if s_remote.kind ==# 'docker'
+    command = ['docker', 'exec', '-it', '-w', s_remote.root, s_remote.target,
+      'sh']
+    if !empty(argument)
+      extend(command, ['-lc', argument])
+    endif
+  else
+    var script = 'cd ' .. shellescape(s_remote.root) .. ' && '
+    script ..= empty(argument)
+      ? 'exec "${SHELL:-sh}" -l'
+      : 'exec "${SHELL:-sh}" -lc ' .. shellescape(argument)
+    command = ['ssh', '-t', s_remote.target, 'sh', '-lc', ShellLiteral(script)]
+  endif
+  return {
+    command: command,
+    cwd: '',
+    name: printf('%s:%s:%s', s_remote.kind, s_remote.target,
+      fnamemodify(s_remote.root, ':t')),
+    remote: true,
+    workspace: copy(get(g:, 'simpleremote_workspace', {})),
+  }
+enddef
+
 def g:SimpleRemoteTerminal()
   if !IsReady()
     Error('[SimpleRemote] not connected')
     return
   endif
-  var command: list<string>
-  if s_remote.kind ==# 'docker'
-    command = ['docker', 'exec', '-it', '-w', s_remote.root,
-      s_remote.target, 'sh']
-  else
-    var script = 'cd ' .. shellescape(s_remote.root)
-      .. ' && exec "${SHELL:-sh}" -l'
-    command = ['ssh', '-t', s_remote.target, 'sh', '-lc', ShellLiteral(script)]
+  if exists(':SimpleTerminalNew') == 2
+    execute 'SimpleTerminalNew'
+    return
   endif
+  var spec = g:SimpleRemoteTerminalSpec()
   botright new
-  term_start(command, {
+  term_start(spec.command, {
     curwin: true,
-    term_name: printf('SimpleRemote:%s:%s', s_remote.kind, s_remote.target),
+    term_name: 'SimpleRemote:' .. spec.name,
   })
   startinsert
 enddef
