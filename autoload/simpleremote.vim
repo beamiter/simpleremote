@@ -3645,6 +3645,30 @@ def g:SimpleRemoteShellCommand(command: string): list<string>
     : ['ssh', '-T', s_remote.target, 'sh', '-c', ShellLiteral(script)]
 enddef
 
+# Read a text file from the active workspace without opening a buffer.  The
+# callback receives (ok, content-or-error).  This is intentionally asynchronous:
+# consumers such as SimpleFinder can update a preview while keeping Vim's UI
+# responsive, and they reuse the persistent agent connection instead of opening
+# another SSH session for every cursor movement.
+def g:SimpleRemoteReadFile(path: string, Callback: func): number
+  if !IsReady()
+    call(Callback, [false, 'remote workspace is not ready'])
+    return -1
+  endif
+  var remote_path = substitute(path, '^remote://', '', '')
+  if remote_path !~# '^/'
+    remote_path = JoinRemotePath(s_remote.root, remote_path)
+  endif
+  remote_path = NormalizeTreeRoot(remote_path)
+  if !UnderRoot(remote_path, s_remote.root)
+    call(Callback, [false, 'remote path is outside the active workspace'])
+    return -1
+  endif
+  return Send('read', remote_path, (ok, body) => {
+    call(Callback, [ok, ok ? UnB64(body) : body])
+  })
+enddef
+
 def g:SimpleRemoteStatusline(): string
   var latency = get(get(s_remote, 'runtime_probe', {}), 'runtime_ms', '')
   return empty(s_remote) ? '' : printf('%s:%s:%s%s',

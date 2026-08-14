@@ -128,6 +128,8 @@ Events expose their payload in g:simpleremote_event:
   g:SimpleRemoteLocalPath(remote_path)
   g:SimpleRemoteRemotePath(local_path)
   g:SimpleRemoteShellCommand(command)
+  g:SimpleRemoteReadFile(path, Callback)
+  g:SimpleRemoteTreeSetRoot(path)
   g:SimpleRemoteStatusline()
 
 SimpleRemoteRecentWorkspaces() returns normalized workspace dictionaries and
@@ -140,6 +142,16 @@ g:SimpleRemoteShellCommand() returns an argv list suitable for job_start().
 This is the integration boundary for simple* daemons that need to execute on
 the active SSH host or in the active Docker container.  With the Rust runtime
 installed, returned commands share its OpenSSH ControlMaster connection.
+
+SimpleRemoteReadFile() asynchronously reads a text file inside the active
+workspace without opening a buffer.  Callback is called as (ok,
+content-or-error).  Relative paths use the workspace root; paths outside the
+workspace are rejected.  SimpleFinder uses this API for virtual-workspace
+previews.
+
+SimpleRemoteTreeSetRoot() changes the real workspace when
+g:simpleremote_sync_tree_root is enabled. SimpleTree and SimpleFinder use it
+for bidirectional root synchronization.
 
 The workspace dictionary also contains "runtime" when the installed
 simpleremote-daemon is active.  SimpleCC uses that executable as its remote

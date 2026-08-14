@@ -51,6 +51,17 @@ def WaitForConfig(name: string, timeout: float = 4.0): bool
   return false
 enddef
 
+def WaitFor(Condition: func(): bool, timeout: float = 4.0): bool
+  var started = reltime()
+  while reltimefloat(reltime(started)) < timeout
+    if Condition()
+      return true
+    endif
+    sleep 10m
+  endwhile
+  return Condition()
+enddef
+
 def FireRoot(root: string, old_root: string, source: string)
   g:simpletree_event = {
     root: root,
@@ -67,6 +78,34 @@ def Run()
   assert_true(WaitForConfig('base'), 'initial config was not loaded')
   var first_id = g:simpleremote_workspace.id
   assert_equal(BASE, g:simpleremote_workspace.local_root)
+
+  # Finder previews use the public asynchronous reader rather than opening a
+  # temporary remote buffer for every selected result.
+  var read_done = false
+  var read_ok = false
+  var read_body = ''
+  writefile(['finder preview'], BASE .. '/finder.txt')
+  assert_true(g:SimpleRemoteReadFile('finder.txt', (ok, body) => {
+    read_ok = ok
+    read_body = body
+    read_done = true
+  }) > 0)
+  assert_true(WaitForRoot(BASE) && WaitFor(() => read_done),
+    'public remote read did not complete')
+  assert_true(read_ok)
+  assert_equal("finder preview\n", read_body)
+
+  var rejected = false
+  assert_equal(-1, g:SimpleRemoteReadFile('/outside-workspace', (_, body) => {
+    rejected = body =~# 'outside the active workspace'
+  }))
+  assert_true(rejected, 'public remote read accepts an outside path')
+
+  rejected = false
+  assert_equal(-1, g:SimpleRemoteReadFile('../outside-workspace', (_, body) => {
+    rejected = body =~# 'outside the active workspace'
+  }))
+  assert_true(rejected, 'public remote read accepts parent traversal')
 
   # A user re-root inside the projection becomes a real remote workspace.  It
   # reconnects with the precise local half of an explicit local map.

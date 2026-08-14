@@ -16,6 +16,10 @@ For SSH targets it uses a private deterministic OpenSSH ControlPath and
 ControlPersist, so filesystem RPC, reconnects, and other simple* processes can
 reuse authentication and the underlying connection.
 
+The runtime replaces itself with the SSH/Docker transport for agent and exec
+jobs, so stopping a Vim job also stops the corresponding remote search or
+language-tool process instead of leaving it behind a local relay.
+
 `simpleremote-daemon exec` is the shared stdio process boundary. SimpleCC uses
 it to run pyright, basedpyright, or another language server in the active
 remote workspace. The runtime prepends the project `.venv/bin` when present.
@@ -27,6 +31,18 @@ Set `g:simpleremote_use_daemon = 0` to disable the runtime, or set
 
 See `:help simpleremote` for commands, profiles, workspace projection, and the
 integration API.
+
+## SimpleFinder integration
+
+SimpleFinder detects the active remote workspace automatically.  In a virtual
+workspace its file, grep, interactive grep, word/visual grep, symbol, and Git
+file sources execute through SimpleRemote's shared SSH/Docker transport;
+results open as `remote://` buffers and previews are read asynchronously over
+the persistent agent.  A mounted or explicitly mapped workspace keeps using
+SimpleFinder's native local daemon against the projected local root.
+Workspace changes refresh a live finder panel, while `:SimpleFinderRoot`
+switches the real SimpleRemote workspace in the other direction. Set
+`g:simplefinder_remote = 0` to opt out.
 
 ## Runtime probe and remote environment
 

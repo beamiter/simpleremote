@@ -2,8 +2,9 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,14 +68,13 @@ fn run() -> Result<u8, String> {
             .map_err(|error| format!("cannot write probe error: {error}"))?;
         return Ok(output.status.code().unwrap_or(1).clamp(0, 255) as u8);
     }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command
-        .spawn()
-        .map_err(|error| format!("cannot start {} transport: {error}", parsed.kind))?;
-    proxy(child)
+    // The runtime has no work left once the transport command is assembled.
+    // Replacing ourselves instead of proxying three pipes preserves the same
+    // stdio boundary while making job_stop() reach SSH/Docker directly.  This
+    // matters for debounced consumers such as SimpleFinder: cancelling an old
+    // grep must cancel its remote process too, not merely its local relay.
+    let error = command.exec();
+    Err(format!("cannot start {} transport: {error}", parsed.kind))
 }
 
 fn parse_args(values: Vec<String>) -> Result<RuntimeArgs, String> {
@@ -361,32 +361,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-fn proxy(mut child: Child) -> Result<u8, String> {
-    let mut child_stdin = child.stdin.take().ok_or("transport has no stdin")?;
-    let mut child_stdout = child.stdout.take().ok_or("transport has no stdout")?;
-    let mut child_stderr = child.stderr.take().ok_or("transport has no stderr")?;
-
-    let _input = thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut child_stdin);
-    });
-    let output = thread::spawn(move || {
-        let _ = io::copy(&mut child_stdout, &mut io::stdout().lock());
-    });
-    let errors = thread::spawn(move || {
-        let _ = io::copy(&mut child_stderr, &mut io::stderr().lock());
-    });
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for transport: {error}"))?;
-    // The input thread may still be blocked on the parent pipe after a remote
-    // process exits.  Dropping its handle lets the runtime return immediately;
-    // process exit closes the remaining pipe descriptors.
-    let _ = output.join();
-    let _ = errors.join();
-    Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
 }
 
 #[cfg(test)]
