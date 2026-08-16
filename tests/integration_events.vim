@@ -257,6 +257,39 @@ def Run()
   assert_true(WaitFor(() => !empty(Named('copied'))),
     'the download command did not fire SimpleRemoteFileCopied')
 
+  # A file renamed while its buffer is hidden must keep ONE buffer: reopening
+  # it by the new name used to make a second one, and the two overwrote each
+  # other's saves.
+  silent! only!
+  set hidden
+  writefile(['hide me'], BASE .. '/src/hide.txt')
+  g:VimrcRemoteOpen(BASE .. '/src/hide.txt')
+  assert_true(WaitFor(() => getline(1) ==# 'hide me'), 'hide.txt did not open')
+  var hidden_buf = bufnr()
+  g:VimrcRemoteOpen(BASE .. '/src/beta.txt')
+  assert_true(WaitFor(() => getline(1) =~# '^beta'), 'second file did not open')
+  assert_true(bufexists(hidden_buf) && bufwinid(hidden_buf) < 0,
+    'the first buffer should now be hidden')
+  var done_rename = false
+  g:SimpleRemoteExecute('mv ' .. shellescape(BASE .. '/src/hide.txt')
+    .. ' ' .. shellescape(BASE .. '/src/moved.txt'), (_, __) => {
+    done_rename = true
+  })
+  assert_true(WaitFor(() => done_rename), 'the remote move did not finish')
+  # Retarget it the way a tree rename does, then reopen under the new name.
+  g:SimpleRemoteRetargetBuffers(BASE .. '/src/hide.txt', BASE .. '/src/moved.txt')
+  g:VimrcRemoteOpen(BASE .. '/src/moved.txt')
+  assert_true(WaitFor(() => getline(1) ==# 'hide me'),
+    'the renamed file did not reopen')
+  assert_equal(hidden_buf, bufnr(),
+    'reopening a renamed file made a second buffer for it')
+  assert_equal('remote://' .. BASE .. '/src/moved.txt', bufname(),
+    'the reused buffer kept its stale name')
+  var on_path = len(filter(getbufinfo(),
+    (_, info) => get(getbufvar(info.bufnr, 'vimrc_remote', {}), 'path', '')
+      ==# BASE .. '/src/moved.txt'))
+  assert_equal(1, on_path, 'more than one buffer holds the same remote path')
+
   # An API write announces a change too.
   var done = false
   g:SimpleRemoteWriteFile('src/beta.txt', "beta2\n", (_, __) => {

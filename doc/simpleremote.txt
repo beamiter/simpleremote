@@ -90,6 +90,8 @@ Options:
   g:simpleremote_use_sshfs            'auto', 'never', 1, or 0
   g:simpleremote_change_directory     'tab', 'global', or 'none'
   g:simpleremote_open_tree_on_connect 1 to open the tree after connecting
+                                      (a connection spec may override it, so
+                                      a session restore opens no tree)
   g:simpleremote_sync_tree_root       1 to follow SimpleTree root changes
   g:simpleremote_default_root         root used by the target picker
   g:simpleremote_tree_width           virtual tree width
@@ -225,6 +227,7 @@ connection is ready:
   g:SimpleRemoteTerminalSpec([command])
   g:SimpleRemoteTreeSetRoot(path)
   g:SimpleRemoteStatusline()
+  g:SimpleRemoteRetargetBuffers(source, target)
   g:SimpleRemoteRuntimeCapabilities()
   g:SimpleRemoteSessionLines()
 
@@ -265,6 +268,12 @@ the scp/docker-cp fallback alike.  A download never replaces a local
 directory, forced or not.  Callback(ok, {remote, local, error}) runs when the
 transfer finishes and the matching SimpleRemoteFileCopied /
 SimpleRemoteFileUploaded event fires.
+
+SimpleRemoteRetargetBuffers() points every open buffer under {source} at
+{target}, which is what the tree does after a rename: the buffers keep their
+unsaved contents and are renamed to match, so a later open of the new path
+finds the buffer that is already there instead of making a second one for the
+same file.  Call it after renaming or moving something by other means.
 
 SimpleRemoteRuntimeCapabilities() returns the installed runtime's
 capabilities object ({} without a runtime): version, bridge_protocol,

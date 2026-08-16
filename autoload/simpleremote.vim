@@ -54,6 +54,51 @@ def UnB64(value: string): string
   return system('base64 ' .. Base64DecodeFlag(), value)
 enddef
 
+# UnB64() cannot carry a file body: system() replaces every NUL in its output
+# with SOH, so a byte that a binary file legitimately contains would reach the
+# buffer as a different one and be written back that way.  Vim's own binary
+# representation — a NUL inside a line, lines separated by NL, which is what
+# readfile(..., 'b') produces and writefile(..., 'b') consumes — has no such
+# hole, so file bodies travel through a temporary file instead of a pipe.
+# Everything else (listings, command output, error messages) keeps the cheap
+# path: none of it can contain a NUL that means anything.
+def DecodeBase64ToLines(encoded: string): list<string>
+  var encoded_file = tempname()
+  var raw_file = tempname()
+  var lines: list<string> = []
+  try
+    writefile([encoded], encoded_file)
+    system(printf('base64 %s < %s > %s', Base64DecodeFlag(),
+      shellescape(encoded_file), shellescape(raw_file)))
+    if v:shell_error == 0 && filereadable(raw_file)
+      lines = readfile(raw_file, 'b')
+    endif
+  catch
+    lines = []
+  finally
+    delete(encoded_file)
+    delete(raw_file)
+  endtry
+  return lines
+enddef
+
+# The mirror image: buffer lines to base64, with the final newline expressed
+# the way readfile()/writefile() express it — a trailing empty item.
+def EncodeLinesToBase64(lines: list<string>, final_eol: bool): string
+  var raw_file = tempname()
+  var encoded = ''
+  try
+    writefile(final_eol ? lines + [''] : lines, raw_file, 'b')
+    encoded = system(printf('base64 < %s', shellescape(raw_file)))
+      ->substitute('\n', '', 'g')
+  catch
+    encoded = ''
+  finally
+    delete(raw_file)
+  endtry
+  return encoded
+enddef
+
 def Error(message: string)
   echohl ErrorMsg
   echomsg message
@@ -106,7 +151,9 @@ enddef
 # it, Vim spawns `base64` itself exactly as it always has.
 def LegacyPayload(op: string, args: dict<any>): string
   if op ==# 'write'
-    return get(args, 'path', '') .. "\t" .. B64(get(args, 'content', ''))
+    # content_b64 is already the agent's inner layer, byte for byte.
+    return get(args, 'path', '') .. "\t" .. (has_key(args, 'content_b64')
+      ? args.content_b64 : B64(get(args, 'content', '')))
   endif
   if op ==# 'exec' || op ==# 'grep'
     return get(args, 'command', '')
@@ -117,10 +164,12 @@ enddef
 def WireLine(id: number, op: string, args: dict<any>): string
   if get(s_remote, 'protocol', 'legacy') ==# 'json'
     var request = extend({id: id, op: op}, args, 'keep')
-    if op ==# 'write'
+    if op ==# 'write' && !has_key(request, 'content_b64')
       # json_encode() replaces invalid UTF-8 with U+FFFD; base64 keeps every
       # byte of a latin-1 or mixed-encoding buffer intact on the way out.
       request.content_b64 = B64(get(args, 'content', ''))
+    endif
+    if op ==# 'write' && has_key(request, 'content')
       remove(request, 'content')
     endif
     return json_encode(request) .. "\n"
@@ -128,7 +177,10 @@ def WireLine(id: number, op: string, args: dict<any>): string
   return id .. "\t" .. op .. "\t" .. B64(LegacyPayload(op, args)) .. "\n"
 enddef
 
-def Send(op: string, args: dict<any>, Callback: func): number
+# `wants_lines` asks for the reply as buffer lines — Vim's binary
+# representation, byte for byte — instead of a string that cannot hold a NUL.
+def Send(op: string, args: dict<any>, Callback: func,
+    wants_lines: bool = false): number
   if empty(s_remote) || get(s_remote, 'channel', v:null) == v:null
     Error('[VimrcRemote] not connected')
     call(Callback, [false, 'not connected'])
@@ -152,6 +204,7 @@ def Send(op: string, args: dict<any>, Callback: func): number
     callback: Callback,
     operation: op,
     timer: timer,
+    wants_lines: wants_lines,
   }
   try
     ch_sendraw(s_remote.channel, WireLine(id, op, args))
@@ -186,20 +239,25 @@ def DecodeLine(line: string): dict<any>
     if type(message) != v:t_dict || !has_key(message, 'id')
       return {}
     endif
-    var data = has_key(message, 'data_b64')
-      ? UnB64(get(message, 'data_b64', ''))
-      : get(message, 'data', '')
+    var binary = has_key(message, 'data_b64')
+    var data = binary ? get(message, 'data_b64', '') : get(message, 'data', '')
     return {
       key: string(get(message, 'id', '')),
       ok: !!get(message, 'ok', false),
+      # Left encoded when it is binary: only the caller knows whether it wants
+      # bytes (a buffer) or text (an API consumer).
       data: type(data) == v:t_string ? data : string(data),
+      binary: binary,
     }
   endif
   var parts = split(line, "\t", 1)
   if len(parts) != 3
     return {}
   endif
-  return {key: parts[0], ok: parts[1] ==# 'ok', data: UnB64(parts[2])}
+  # The outer layer is always base64 text, so decoding it through a pipe is
+  # safe; whether the result is itself encoded depends on the operation.
+  return {key: parts[0], ok: parts[1] ==# 'ok', data: UnB64(parts[2]),
+    binary: false}
 enddef
 
 def OnLine(generation: number, _channel: any, line: string)
@@ -212,15 +270,22 @@ def OnLine(generation: number, _channel: any, line: string)
   endif
   var entry = remove(s_remote.pending, reply.key)
   StopRequestTimer(entry)
-  var data = reply.data
-  if reply.ok && get(s_remote, 'protocol', 'legacy') !=# 'json'
-        && (entry.operation ==# 'read' || entry.operation ==# 'read-config')
-    # The agent base64-encodes file bodies before the protocol layer encodes
-    # the whole reply; the bridge peels that inner layer, legacy Vim must.
-    data = UnB64(data)
+  var legacy = get(s_remote, 'protocol', 'legacy') !=# 'json'
+  var reads_a_file = entry.operation ==# 'read' || entry.operation ==# 'read-config'
+  # The agent base64-encodes file bodies before the protocol layer encodes the
+  # whole reply.  What is still encoded at this point differs by transport:
+  # legacy has the agent's inner layer, the bridge sends data_b64 only for
+  # payloads a JSON string cannot carry.
+  var encoded = reply.ok && (reply.binary || (legacy && reads_a_file))
+  if get(entry, 'wants_lines', false)
+    var lines = !reply.ok ? [reply.data]
+      : encoded ? DecodeBase64ToLines(reply.data)
+      : RemoteLines(reply.data, false)
+    call(entry.callback, [reply.ok, lines])
+    return
   endif
-  var Callback = entry.callback
-  call(Callback, [reply.ok, data])
+  var data = encoded ? UnB64(reply.data) : reply.data
+  call(entry.callback, [reply.ok, data])
 enddef
 
 def OnError(generation: number, _channel: any, line: string)
@@ -516,6 +581,18 @@ def Disconnect(show_message: bool = true, reason: string = 'disconnect')
   Emit('SimpleRemoteDisconnected', {reason: reason})
 enddef
 
+# Whether this connection should put a tree on screen.  An option carried by
+# the connection spec is an explicit answer and wins in both directions — a
+# session restore asks for no tree, g:SimpleRemoteOpenWorkspace asks for one —
+# and the global is the default when the spec says nothing.
+def OpenTreeOnConnect(): bool
+  var options = get(s_remote, 'options', {})
+  if has_key(options, 'open_tree')
+    return !!options.open_tree
+  endif
+  return !!get(g:, 'simpleremote_open_tree_on_connect', 1)
+enddef
+
 def FinishConnection(generation: number)
   if !IsCurrent(generation)
     return
@@ -540,8 +617,7 @@ def FinishConnection(generation: number)
   for path in queued
     OpenRemote(path)
   endfor
-  if (get(g:, 'simpleremote_open_tree_on_connect', 1)
-      || get(get(s_remote, 'options', {}), 'open_tree', false)) && !mounting
+  if OpenTreeOnConnect() && !mounting
     timer_start(0, (_) => OpenWorkspaceTree())
   endif
 enddef
@@ -667,9 +743,13 @@ def Connect(kind: string, target: string, root: string,
   })
 enddef
 
-def RemoteLines(content: string): list<string>
+# Split a text payload into buffer lines.  With `drop_final_eol` the trailing
+# empty item a final newline produces is removed, which is what a buffer wants;
+# without it the item stays, which is how readfile(..., 'b') reports the same
+# fact and how the write path expects to see it.
+def RemoteLines(content: string, drop_final_eol: bool = true): list<string>
   var lines = split(content, "\n", 1)
-  if content =~# "\n$" && len(lines) > 1 && lines[-1] ==# ''
+  if drop_final_eol && content =~# "\n$" && len(lines) > 1 && lines[-1] ==# ''
     remove(lines, -1)
   endif
   return empty(lines) ? [''] : lines
@@ -718,13 +798,21 @@ def OpenRemote(path: string)
   var remote_path = path =~# '^/' ? path
         : s_remote.root ==# '/' ? '/' .. path : s_remote.root .. '/' .. path
   var uri = 'remote://' .. remote_path
-  var existing = bufnr(uri)
+  var existing = RemoteBufferFor(remote_path)
   var was_loaded = existing > 0 && bufloaded(existing)
   if existing > 0 && getbufvar(existing, '&modified')
         && get(getbufvar(existing, 'vimrc_remote', {}), 'generation', -1)
           != s_remote.generation
     Error('[VimrcRemote] refusing to replace modified buffer from an old connection')
     return
+  endif
+  if existing > 0 && bufname(existing) !=# uri
+    # Renamed while it was hidden, so it still answers to the old name.  Show
+    # it and give it the right one: :edit on the new name would otherwise make
+    # a second buffer for the same file, and the two would overwrite each
+    # other's saves.  Any unsaved work in it survives, which is the point.
+    execute 'buffer ' .. existing
+    SyncRemoteBufferName(existing)
   endif
   execute 'edit ' .. fnameescape(uri)
   if was_loaded
@@ -737,7 +825,7 @@ def JoinRemotePath(root: string, path: string): string
 enddef
 
 def ApplyRemoteRead(buf: number, generation: number, request_id: number,
-    remote_path: string, uri: string, ok: bool, body: string)
+    remote_path: string, uri: string, ok: bool, body: list<string>)
   if !IsCurrent(generation) || !bufexists(buf)
     return
   endif
@@ -747,7 +835,7 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
   endif
   setbufvar(buf, 'vimrc_remote_read', {})
   if !ok
-    Error('[VimrcRemote] ' .. body)
+    Error('[VimrcRemote] ' .. join(body, ' '))
     return
   endif
   if getbufvar(buf, 'changedtick', -1) != get(pending, 'tick', -2)
@@ -756,14 +844,21 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     return
   endif
 
-  var content = body
-  var lines = RemoteLines(content)
+  # A trailing empty item is how both readfile(..., 'b') and RemoteLines()
+  # report a final newline; the buffer records it as 'endofline' instead.
+  var lines = copy(body)
+  var final_eol = len(lines) > 1 && lines[-1] ==# ''
+  if final_eol
+    remove(lines, -1)
+  elseif empty(lines)
+    lines = ['']
+  endif
   var old_count = len(getbufline(buf, 1, '$'))
   setbufline(buf, 1, lines)
   if old_count > len(lines)
     deletebufline(buf, len(lines) + 1, old_count)
   endif
-  setbufvar(buf, '&endofline', content =~# "\n$")
+  setbufvar(buf, '&endofline', final_eol)
   setbufvar(buf, '&buftype', 'acwrite')
   setbufvar(buf, '&swapfile', 0)
   setbufvar(buf, 'vimrc_remote', {
@@ -797,7 +892,8 @@ def ReadRemote(uri: string)
   var remote_path = substitute(uri, '^remote://', '', '')
   var request_id = 0
   request_id = Send('read', {path: remote_path}, (ok, body) =>
-    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body))
+    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body),
+    true)
   if request_id >= 0
     setbufvar(buf, 'vimrc_remote_read', {
       request_id: request_id,
@@ -870,13 +966,10 @@ def WriteRemote(buf: number = bufnr())
   if buf == bufnr()
     silent doautocmd <nomodeline> BufWritePre
   endif
-  var content = join(getbufline(buf, 1, '$'), "\n")
-  if BufferHasFinalEol(buf)
-    content ..= "\n"
-  endif
   var tick = getbufvar(buf, 'changedtick', -1)
   var final_eol = BufferHasFinalEol(buf)
-  Send('write', {path: info.path, content: content}, (ok, body) =>
+  var encoded = EncodeLinesToBase64(getbufline(buf, 1, '$'), final_eol)
+  Send('write', {path: info.path, content_b64: encoded}, (ok, body) =>
     FinishRemoteWrite(buf, generation, tick, final_eol, ok, body))
 enddef
 
@@ -1134,16 +1227,17 @@ def OnSshfsExit(generation: number, mountpoint: string,
   if status == 0 && isdirectory(mountpoint)
     ActivateProjection(mountpoint, 'sshfs', true)
     echomsg '[SimpleRemote] SSHFS workspace ready: ' .. mountpoint
-    if get(g:, 'simpleremote_open_tree_on_connect', 1)
-        || get(get(s_remote, 'options', {}), 'open_tree', false)
+    if OpenTreeOnConnect()
       timer_start(0, (_) => OpenWorkspaceTree())
     endif
     return
   endif
   PublishWorkspace('virtual')
   echomsg '[SimpleRemote] SSHFS unavailable; using virtual workspace'
-  if get(g:, 'simpleremote_open_tree_on_connect', 1)
-      || get(get(s_remote, 'options', {}), 'open_tree', false)
+  # The mount failed, so the workspace is virtual after all: say so, or a
+  # listener that acted on 'mounting' keeps waiting for a projection.
+  Emit('SimpleRemoteWorkspaceChanged', WorkspaceSnapshot())
+  if OpenTreeOnConnect()
     timer_start(0, (_) => OpenWorkspaceTree())
   endif
 enddef
@@ -2513,10 +2607,7 @@ def RemoteTreeMutationFinished(generation: number, label: string,
   endif
   echomsg '[SimpleRemote] ' .. label .. ': ' .. focus
   if open_after
-    var source_win = get(s_tree, 'source_win', 0)
-    if source_win > 0 && win_id2win(source_win) > 0
-      win_gotoid(source_win)
-    endif
+    FocusEditWindow()
     OpenRemote(focus)
   endif
 enddef
@@ -2559,12 +2650,43 @@ enddef
 # window and a hidden one waits for its next BufEnter (see
 # g:VimrcRemoteActivateBuffer).  The unlisted buffer Vim keeps for the old
 # name is wiped so it cannot be picked up as a stale remote:// entry.
+# Find the buffer already holding a remote path, whatever it is currently
+# named: a buffer renamed while hidden keeps its old name until it is entered,
+# and looking it up by name alone would make a second buffer for the same file
+# — two buffers whose writes overwrite each other.
+def RemoteBufferFor(remote_path: string): number
+  var direct = bufnr('^remote://' .. remote_path .. '$')
+  if direct > 0
+    return direct
+  endif
+  for info in getbufinfo()
+    var remote = getbufvar(info.bufnr, 'vimrc_remote', {})
+    if type(remote) == v:t_dict && get(remote, 'path', '') ==# remote_path
+      return info.bufnr
+    endif
+  endfor
+  return -1
+enddef
+
 def SyncRemoteBufferName(buf: number)
   var info = getbufvar(buf, 'vimrc_remote', {})
   var uri = type(info) == v:t_dict ? get(info, 'uri', '') : ''
   if empty(uri) || bufname(buf) ==# uri
     return
   endif
+  # Another buffer may already carry the name this one is taking — a leftover
+  # of an earlier rename.  Vim refuses :file when the name is taken, and the
+  # error would be swallowed, so clear the way or say why it cannot be.
+  for taken in getbufinfo()
+    if taken.bufnr == buf || taken.name !=# uri
+      continue
+    endif
+    if taken.listed || get(taken, 'changed', 0)
+      Error('[SimpleRemote] another buffer already holds ' .. uri)
+      return
+    endif
+    execute 'silent! bwipeout ' .. taken.bufnr
+  endfor
   var old_name = bufname(buf)
   var winid = bufwinid(buf)
   if buf == bufnr()
@@ -3562,6 +3684,28 @@ def OpenWorkspaceTree(reveal: string = '')
   endif
 enddef
 
+# Put the cursor in a window a file may be opened in: the tree's own source
+# window when it is still there, else any ordinary window, else a new split —
+# never the tree itself, whose buffer is wiped when it is replaced.
+def FocusEditWindow()
+  var source_win = get(s_tree, 'source_win', 0)
+  if source_win > 0 && win_id2win(source_win) > 0
+    win_gotoid(source_win)
+    if EditableWindow() == win_getid()
+      return
+    endif
+  endif
+  var editable = EditableWindow()
+  if editable > 0
+    win_gotoid(editable)
+  else
+    botright new
+  endif
+  if !empty(s_tree)
+    s_tree.source_win = win_getid()
+  endif
+enddef
+
 def RemoteTreeActivate(action: string)
   var nodes = get(b:, 'simpleremote_tree_nodes', [])
   var index = line('.') - 1
@@ -3579,17 +3723,7 @@ def RemoteTreeActivate(action: string)
     endif
     return
   endif
-  var source_win = get(s_tree, 'source_win', 0)
-  if source_win > 0 && win_id2win(source_win) > 0
-    win_gotoid(source_win)
-  else
-    wincmd p
-    var editable = EditableWindow()
-    if editable > 0
-      win_gotoid(editable)
-    endif
-    s_tree.source_win = win_getid()
-  endif
+  FocusEditWindow()
   if action ==# 'edit'
     OpenRemote(node.path)
   else
@@ -4448,6 +4582,15 @@ def g:SimpleRemoteUpload(local_path: string, remote_path: string,
     settings.recursive = isdirectory(local)
   endif
   return StartTransfer('upload', remote, local, settings, Callback)
+enddef
+
+# Point every buffer under {source} at {target}, the way a tree rename does.
+# Exposed so a caller that renames through its own means — a terminal, a
+# script, another plugin — can keep the open buffers coherent.
+def g:SimpleRemoteRetargetBuffers(source: string, target: string)
+  if IsReady()
+    RetargetRemoteBuffers(source, target)
+  endif
 enddef
 
 def g:SimpleRemoteRuntimeCapabilities(): dict<any>
