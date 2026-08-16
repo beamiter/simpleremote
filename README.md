@@ -50,6 +50,12 @@ Set `g:simpleremote_use_daemon = 0` to disable the runtime, or set
 
 ## Integration API for simple\* plugins
 
+`make suite-check` loads the installed siblings alongside SimpleRemote,
+connects a fixture-backed workspace and asserts that each one reacts — the
+one test that exercises the contract instead of a stub of it. It is separate
+from `make check` because that gate must pass in a checkout containing this
+plugin alone.
+
 Everything a sibling needs is a global function or a `User` event, all
 feature-detected, none required. `:help simpleremote-suite` maps who uses
 what; the short list:

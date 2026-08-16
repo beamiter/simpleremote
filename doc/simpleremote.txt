@@ -394,6 +394,14 @@ SimpleWhichKey
              names the tree's multi-key mappings through
              simplewhichkey#Describe(..., 'n', true).
 
+Each plugin's own test suite stubs the other side away, because each has to
+build and pass on its own — which leaves the contract itself untested.
+`make suite-check` closes that gap: it loads the installed siblings next to
+SimpleRemote, connects a fixture-backed workspace and checks that each one
+actually reacts.  It is not part of `make check`, which must pass in a
+checkout holding this plugin alone; siblings that are not installed are
+skipped and named in its report.
+
 RUNTIME PROBE                                      *simpleremote-runtime-probe*
 
 After connection the Rust runtime performs a non-blocking environment probe.

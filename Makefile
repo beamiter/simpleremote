@@ -1,4 +1,4 @@
-.PHONY: build install check workspace-sync virtual-tree runtime-exec transport-bridge integration-events
+.PHONY: build install check workspace-sync virtual-tree runtime-exec transport-bridge integration-events suite-check
 
 build:
 	cargo build --release --locked
@@ -49,3 +49,14 @@ integration-events:
 	SIMPLEREMOTE_TEST_ROOT="$(CURDIR)" \
 	SIMPLEREMOTE_TEST_TARGET="fixture-target" \
 	vim -Nu NONE -n -i NONE -es -S tests/integration_events.vim
+
+# Cross-plugin integration against the real siblings.  Deliberately outside
+# `check`: that gate has to pass in a checkout holding this plugin alone,
+# which is what CI runs.  Siblings that are not installed are skipped and
+# named in the report.
+suite-check:
+	cargo build --locked
+	PATH="$(CURDIR)/tests/fixtures:$$PATH" \
+	SIMPLEREMOTE_TEST_ROOT="$(CURDIR)" \
+	SIMPLEREMOTE_TEST_TARGET="fixture-target" \
+	vim -Nu NONE -n -i NONE -es -S tests/suite_integration.vim
