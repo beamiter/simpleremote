@@ -29,6 +29,11 @@ var compiled = tempname() .. '.vim'
 writefile(readfile(source) + ['defcompile'], compiled)
 try
   execute 'source ' .. fnameescape(compiled)
+catch
+  # An uncaught exception here would leave -es Vim waiting on stdin instead of
+  # exiting, so CI would hang rather than fail.  Record it and fall through to
+  # the cquit below.
+  add(v:errors, 'defcompile failed: ' .. v:exception .. ' @ ' .. v:throwpoint)
 finally
   delete(compiled)
 endtry
@@ -37,6 +42,13 @@ assert_equal(1, exists('*g:SimpleRemoteConnect'))
 assert_equal(1, exists('*g:SimpleRemoteShellCommand'))
 assert_equal(1, exists('*g:SimpleRemoteProbe'))
 assert_equal(1, exists('*g:SimpleRemoteTreeCopyOut'))
+assert_equal(1, exists('*g:SimpleRemoteTreeUpload'))
+assert_equal(1, exists('*g:SimpleRemoteUpload'))
+assert_equal(1, exists('*g:SimpleRemoteDownload'))
+assert_equal(1, exists('*g:SimpleRemoteExecute'))
+assert_equal(1, exists('*g:SimpleRemoteWriteFile'))
+assert_equal(1, exists('*g:SimpleRemoteListDirectory'))
+assert_equal(1, exists('*g:SimpleRemoteRuntimeCapabilities'))
 assert_equal(1, exists('*g:SimpleRemoteTreeSetRoot'))
 assert_equal(1, exists('*g:SimpleRemoteTreeHelp'))
 assert_equal(1, exists('*g:SimpleRemoteTreeFind'))

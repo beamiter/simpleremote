@@ -8,6 +8,8 @@ CONTENTS                                                    *simpleremote*
 3. Profiles                                      |simpleremote-profiles|
 4. Workspace modes                               |simpleremote-workspace|
 5. Public API                                    |simpleremote-api|
+6. Rust runtime                                  |simpleremote-runtime|
+7. Suite integration                             |simpleremote-suite|
 
 =============================================================================
 1. OVERVIEW                                      *simpleremote-overview*
@@ -48,8 +50,19 @@ functions cannot be made transparent in virtual mode.
 :SimpleRemoteExec {command}   Execute in the remote workspace root.
 :SimpleRemoteFind {query}     Find remote file names.
 :SimpleRemoteGit {args}       Run remote Git and populate quickfix.
-:SimpleRemoteTerminal         Open an interactive remote terminal.
-:SimpleRemoteInstallAgent    Install/update the bundled shell agent.
+:SimpleRemoteTerminal [cmd]   Open an interactive remote terminal, or run
+                              {cmd} in one.
+:SimpleRemoteUpload {local} [dir]
+                              Upload a local file or directory into the
+                              remote workspace ({dir} defaults to the tree
+                              root or the workspace root).
+:SimpleRemoteDownload {remote} [local]
+                              Download a remote file or directory; {local}
+                              defaults to SimpleTree's selected directory or
+                              the current directory.
+:SimpleRemoteInstallAgent    Force-reinstall the bundled shell agent.  Not
+                              normally needed: every connection installs or
+                              updates the agent itself.
 :SimpleRemoteHealth           Check remote host tools and working directory.
 :SimpleRemoteStatus           Show transport, root, and projection mode.
 
@@ -92,6 +105,9 @@ Options:
   g:simpleremote_tree_bookmarks_file  local persistent bookmark JSON path
   g:simpleremote_local_roots          explicit target/root to local mappings
   g:simpleremote_agent                remote agent path
+                                      (default ~/.cache/vimrc/simpleremote-agent.sh)
+  g:simpleremote_agent_source         local agent script shipped to targets
+                                      (default bin/simpleremote-agent.sh)
 
 The key for g:simpleremote_local_roots is "kind:target:/remote/root".
 
@@ -110,34 +126,123 @@ Git badges, split/vsplit/tabedit, and workspace-root changes.  Buffer-content
 plugins work; local filesystem daemons require a projection or explicit
 SimpleRemote integration.
 
-Events expose their payload in g:simpleremote_event:
+Events expose their payload in g:simpleremote_event.  Every payload carries
+"event" (the event name), "status" (g:simpleremote_status at the time) and
+"time"; the fields listed are added on top:
 
-  User SimpleRemoteConnecting
-  User SimpleRemoteConnected
-  User SimpleRemoteWorkspaceChanged
-  User SimpleRemoteDisconnected
+  User SimpleRemoteConnecting        the connection spec {kind, target, root}
+  User SimpleRemoteConnected         the workspace snapshot (see below)
+  User SimpleRemoteWorkspaceChanged  the snapshot after a projection was
+                                     activated (local_root, mode)
+  User SimpleRemoteRuntimeReady      the snapshot once "probe" is populated;
+                                     also fired after Connected when the
+                                     probe finished during the handshake
+  User SimpleRemoteTreeRootChanged   {root, workspace, mode} for a view-only
+                                     tree re-root
+  User SimpleRemoteBufferRead        {type: 'buffer-read', bufnr, path,
+                                     workspace} after a remote:// buffer was
+                                     (re)filled and its filetype detected
+  User SimpleRemoteFilesChanged      {changes: [{path, type}], workspace}
+                                     for created/changed/deleted paths made
+                                     by the tree, uploads and API writes —
+                                     not by buffer writes, which fire
+                                     BufWritePre/BufWritePost like local
+                                     files
+  User SimpleRemoteConfigChanged     {config} when the remote simplecc.json
+                                     was reloaded on a live connection
+  User SimpleRemoteFileCopied        {remote, local} after a download
+  User SimpleRemoteFileUploaded      {remote, local} after an upload
+  User SimpleRemoteDisconnected      {reason}: 'disconnect' for a user or
+                                     transport disconnect, 'reconnect' when
+                                     the connection is being replaced (a
+                                     workspace switch fires Disconnected,
+                                     Connecting, Connected in that order)
+
+The workspace snapshot, also kept in g:simpleremote_workspace while a
+connection is ready:
+
+  id            connection generation, changes on every (re)connect
+  kind, target  'ssh' or 'docker', and the host or container
+  root          absolute remote workspace root
+  tree_root     the tree's view root (equals root unless detached)
+  local_root    local projection of root, or '' in virtual mode
+  mode          'virtual', 'mounting', 'sshfs', 'docker-bind', 'local-map'
+  runtime       path of the simpleremote-daemon in use, or ''
+  runtime_version, protocol
+                the runtime's version and the transport protocol:
+                'json' (runtime bridge), 'exec' (older runtime) or
+                'legacy' (no runtime)
+  probe         {host, root, git, python, python_version, node,
+                python_lsp, rg, tar, uname, runtime_ms, runtime_version,
+                status} from the runtime probe; {} until it ran
+  uri           'remote://' .. root
 
 =============================================================================
 5. PUBLIC API                                    *simpleremote-api*
 
   g:SimpleRemoteConnect(kind, target, root)
   g:SimpleRemoteRecentWorkspaces([limit])
+  g:SimpleRemoteProfiles()
   g:SimpleRemoteOpenWorkspace(workspace)
   g:SimpleRemoteWorkspaceRoot()
   g:SimpleRemoteProjectRoot()
+  g:SimpleRemoteIsVirtual()
   g:SimpleRemoteLocalPath(remote_path)
   g:SimpleRemoteRemotePath(local_path)
   g:SimpleRemoteShellCommand(command)
+  g:SimpleRemoteExecArgv()
+  g:SimpleRemoteExecute(command, Callback)
   g:SimpleRemoteReadFile(path, Callback)
+  g:SimpleRemoteWriteFile(path, content, Callback)
+  g:SimpleRemoteListDirectory(path, Callback)
+  g:SimpleRemoteDownload(remote, local [, options [, Callback]])
+  g:SimpleRemoteUpload(local, remote [, options [, Callback]])
   g:SimpleRemoteTerminalSpec([command])
   g:SimpleRemoteTreeSetRoot(path)
   g:SimpleRemoteStatusline()
+  g:SimpleRemoteRuntimeCapabilities()
+  g:SimpleRemoteSessionLines()
 
 SimpleRemoteRecentWorkspaces() returns normalized workspace dictionaries and
 is the supported integration point for dashboards such as SimpleStartify.
-SimpleRemoteOpenWorkspace() restores one of those complete specifications and
-opens its workspace tree after the connection is ready, even when automatic
-tree opening is disabled.
+SimpleRemoteProfiles() returns the configured profiles in the same shape with
+"source: 'profile'"; a profile may have an empty root, in which case opening
+it prompts for one.  SimpleRemoteOpenWorkspace() restores one of those
+specifications and opens its workspace tree after the connection is ready,
+even when automatic tree opening is disabled.
+
+SimpleRemoteExecArgv() returns an argv prefix — the runtime's `exec` action
+with the workspace root — to which a caller appends a program and its
+arguments.  Every element is quoted for the remote shell individually, so
+this is the right choice for tools that build a real argv (SimpleGit's
+daemon runs `git -C dir …` this way).  It is empty without an argv-safe
+transport: plain ssh without the runtime re-joins arguments through the
+login shell.  SimpleRemoteShellCommand() remains the choice for shell
+scripts.
+
+SimpleRemoteExecute() runs a shell command in the workspace root over the
+persistent agent connection and calls Callback(ok, output) with the combined
+output; SimpleRemoteWriteFile() writes a text file atomically and calls
+Callback(ok, path-or-error); SimpleRemoteListDirectory() lists a directory
+and calls Callback(ok, entries) with {name, path, type, size, mtime}
+dictionaries (type is 'f', 'd' or 'l').  All three refuse paths outside the
+workspace and reply synchronously with ok = false when no workspace is
+ready.
+
+SimpleRemoteDownload() and SimpleRemoteUpload() stream a file or, with
+{recursive: true}, a directory across the boundary; {force: true} replaces
+an existing destination.  Callback(ok, {remote, local, error}) runs when the
+transfer finishes and the matching SimpleRemoteFileCopied /
+SimpleRemoteFileUploaded event fires.  Uploads that would replace an existing
+remote path fail with 'already exists' unless forced.
+
+SimpleRemoteRuntimeCapabilities() returns the installed runtime's
+capabilities object ({} without a runtime): version, bridge_protocol,
+actions, agent_protocols, agent_bootstrap, recursive_transfer, tty.
+
+SimpleRemoteSessionLines() returns the Vim script lines a session file needs
+to bring the connected workspace back (see |simpleremote-suite| for
+SimpleStartify).
 
 g:SimpleRemoteShellCommand() returns an argv list suitable for job_start().
 This is the integration boundary for simple* daemons that need to execute on
@@ -164,6 +269,96 @@ simpleremote-daemon is active.  SimpleCC uses that executable as its remote
 LSP stdio transport, while older SimpleRemote or SimpleCC versions continue to
 fall back to direct SSH/Docker commands.
 
+=============================================================================
+6. RUST RUNTIME                                  *simpleremote-runtime*
+
+`install.sh` builds `lib/simpleremote-daemon`, a small Rust process that owns
+the local end of every transport.  It keeps no state between invocations:
+one process per connection, command, probe or transfer.
+
+  agent      the persistent connection.  With `--protocol json` the runtime
+             is a bridge: Vim exchanges one JSON object per line
+             ({id, op, path|command|content_b64} in, {id, ok, data|data_b64}
+             out) and the runtime performs every base64 step of the agent's
+             line protocol in-process, so no `base64` process is spawned per
+             request any more.  Payloads that are not valid UTF-8 travel as
+             data_b64 so latin-1 or binary files round-trip byte for byte.
+  exec       run a program in the workspace root (SimpleCC's language
+             servers, SimpleFinder's searches, SimpleGit's git); `--tty`
+             asks the transport for a terminal, which SimpleRemoteTerminalSpec
+             uses so remote shells share the ControlMaster connection and
+             the same PATH prelude the language servers get.
+  probe      report the remote environment and latency.
+  download   stream a remote file — or, with `--recursive`, a directory
+             through tar — into a local path, staged beside the destination
+             and activated by rename.
+  upload     the reverse: a local file or directory into the workspace,
+             refusing an existing destination unless `--force`.
+  capabilities
+             print a JSON object describing the build.  Vim asks once per
+             binary and falls back to the older exec-agent behaviour when
+             the runtime predates the bridge, so a plugin update that outran
+             `install.sh` still connects.
+
+The remote agent is self-installing: every connection ships the bundled
+`bin/simpleremote-agent.sh` inside the launch command, compares it with the
+installed copy and replaces that copy atomically only when it differs.  A
+fresh host and an updated plugin therefore need no
+:SimpleRemoteInstallAgent; an unwritable destination falls back to whatever
+agent is already installed.  Set g:simpleremote_agent_source to ship a
+different script.
+
+For SSH targets every runtime process uses a private, deterministic OpenSSH
+ControlPath with ControlPersist (SIMPLEREMOTE_CONTROL_PERSIST, default 600
+seconds; SIMPLEREMOTE_CONNECT_TIMEOUT, default 10), so the agent, the probe,
+transfers, language servers, searches and terminals all share one
+authenticated connection.
+
+=============================================================================
+7. SUITE INTEGRATION                             *simpleremote-suite*
+
+SimpleRemote never requires a sibling; each integration is feature-detected
+at call time.  What each sibling consumes, so a change here can be traced:
+
+SimpleCC     runs remote language servers through `simpleremote-daemon
+             exec` (workspace.runtime) and reads the remote simplecc.json
+             from g:vimrc_remote_simplecc_config; it owns the LSP lifecycle
+             on SimpleRemoteConnected/Disconnected, attaches to buffers on
+             SimpleRemoteBufferRead, reloads on SimpleRemoteConfigChanged and
+             forwards SimpleRemoteFilesChanged to the servers.
+SimpleFinder searches through g:SimpleRemoteShellCommand(), previews through
+             g:SimpleRemoteReadFile(), re-roots through
+             g:SimpleRemoteTreeSetRoot() and follows the connection events
+             (Connecting keeps its state through a workspace switch).
+SimpleTree   receives root changes through simpletree#ExternalSetRoot(path,
+             'simpleremote'), provides the download destination through
+             simpletree#ExternalDropDirectory() and the upload source
+             through simpletree#ExternalSelectedPath(); its own root changes
+             arrive as User SimpleTreeRootChanged.
+SimpleGit    runs git in the workspace with g:SimpleRemoteExecArgv() and
+             recognises remote:// buffers through b:vimrc_remote.
+SimpleTerminal
+             opens g:SimpleRemoteTerminalSpec() shells and remembers the
+             workspace of each session across Disconnected.
+SimpleLine   shows g:SimpleRemoteStatusline() and shortens remote:// names
+             relative to the workspace root.
+SimpleStartify
+             lists g:SimpleRemoteRecentWorkspaces() and
+             g:SimpleRemoteProfiles(); its session files append
+             g:SimpleRemoteSessionLines() so :SLoad reconnects and re-reads
+             the remote buffers of the session (SimpleRemote listens for
+             User SimpleStartifySessionLoadPost and SessionLoadPost).
+SimpleClipboard
+             receives copied text through simpleclipboard#CopyText() and
+             reads b:vimrc_remote / b:simpleremote_path for :SimpleCopyPath.
+SimpleEditorConfig, SimpleTreesitter, SimpleMinimap, SimpleMarkdown
+             treat remote:// buffers (buftype acwrite) like files and refresh
+             on SimpleRemoteBufferRead; SimpleEditorConfig walks
+             .editorconfig files with g:SimpleRemoteReadFile().
+SimpleWhichKey
+             names the tree's multi-key mappings through
+             simplewhichkey#Describe(..., 'n', true).
+
 vim:tw=78:ts=8:noet:ft=help:norl:
 
 RUNTIME PROBE                                      *simpleremote-runtime-probe*
@@ -185,8 +380,11 @@ In the virtual remote tree:
 
   c/x   Copy/cut the current remote node, or every marked node.
   p     Paste into the selected directory.  Directories copy recursively.
-  gd    Download the selected file to SimpleTree's selected local directory.
-        Without a local SimpleTree root, prompt for the destination.
+  gd    Download the selected file or directory to SimpleTree's selected
+        local directory.  Without a local SimpleTree root, prompt for the
+        destination.
+  gu    Upload a local file or directory into the selected remote directory;
+        SimpleTree's selected node is offered as the default source.
   y     Copy the remote file name.
   Y     Copy the absolute remote path.
   gy    Copy the remote text file contents.
@@ -236,7 +434,8 @@ The virtual tree accepts the SimpleTree-compatible action surface:
   c/x/p               remote copy, cut, paste
   Space, gm, gM       toggle/range mark, mark siblings, clear marks
   m, ', ]b, [b        bookmark, list bookmarks, cycle visible bookmarks
-  y/Y/gy/gd           copy name/path/content or download to the local tree
+  y/Y/gy/gd/gu        copy name/path/content, download to the local tree,
+                      upload from it
 
 All keys in SimpleTree's built-in help panel have a virtual-tree counterpart
 except gx: a remote path has no dependable local system-default application.

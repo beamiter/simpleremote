@@ -14,8 +14,14 @@ var s_workspace_switch_timer = 0
 var s_tree_clipboard: dict<any> = {}
 var s_tree_bookmarks: dict<any> = {}
 var s_tree_bookmarks_loaded = false
+var s_runtime_capabilities: dict<any> = {}
 
 const PROTOCOL = 'simpleremote/2'
+# Captured at script level: <sfile> cannot be expanded inside a :def.
+const SCRIPT_ROOT = fnamemodify(expand('<sfile>:p'), ':h:h')
+# The JSON bridge revision this Vim side speaks; the runtime advertises its own
+# in `simpleremote-daemon capabilities` and the two must agree.
+const BRIDGE_PROTOCOL = 1
 
 g:vimrc_remote_status = 'disconnected'
 g:simpleremote_status = 'disconnected'
@@ -94,7 +100,35 @@ def RequestTimedOut(generation: number, key: string)
   call(Callback, [false, 'request timed out: ' .. entry.operation])
 enddef
 
-def Send(op: string, payload: string, Callback: func): number
+# The agent's line protocol carries one base64 payload per request.  With the
+# JSON bridge (simpleremote-daemon agent --protocol json) the runtime performs
+# every encoding step in-process and Vim exchanges plain JSON objects; without
+# it, Vim spawns `base64` itself exactly as it always has.
+def LegacyPayload(op: string, args: dict<any>): string
+  if op ==# 'write'
+    return get(args, 'path', '') .. "\t" .. B64(get(args, 'content', ''))
+  endif
+  if op ==# 'exec' || op ==# 'grep'
+    return get(args, 'command', '')
+  endif
+  return get(args, 'path', '')
+enddef
+
+def WireLine(id: number, op: string, args: dict<any>): string
+  if get(s_remote, 'protocol', 'legacy') ==# 'json'
+    var request = extend({id: id, op: op}, args, 'keep')
+    if op ==# 'write'
+      # json_encode() replaces invalid UTF-8 with U+FFFD; base64 keeps every
+      # byte of a latin-1 or mixed-encoding buffer intact on the way out.
+      request.content_b64 = B64(get(args, 'content', ''))
+      remove(request, 'content')
+    endif
+    return json_encode(request) .. "\n"
+  endif
+  return id .. "\t" .. op .. "\t" .. B64(LegacyPayload(op, args)) .. "\n"
+enddef
+
+def Send(op: string, args: dict<any>, Callback: func): number
   if empty(s_remote) || get(s_remote, 'channel', v:null) == v:null
     Error('[VimrcRemote] not connected')
     call(Callback, [false, 'not connected'])
@@ -120,8 +154,7 @@ def Send(op: string, payload: string, Callback: func): number
     timer: timer,
   }
   try
-    ch_sendraw(s_remote.channel,
-      id .. "\t" .. op .. "\t" .. B64(payload) .. "\n")
+    ch_sendraw(s_remote.channel, WireLine(id, op, args))
   catch
     var failed_here = false
     if IsCurrent(generation) && has_key(s_remote.pending, key)
@@ -140,18 +173,54 @@ def Send(op: string, payload: string, Callback: func): number
   return id
 enddef
 
+# Every reply reaches its callback fully decoded: file bodies for read and
+# read-config, listings, command output, or an error message.
+def DecodeLine(line: string): dict<any>
+  if get(s_remote, 'protocol', 'legacy') ==# 'json'
+    var message: any
+    try
+      message = json_decode(line)
+    catch
+      return {}
+    endtry
+    if type(message) != v:t_dict || !has_key(message, 'id')
+      return {}
+    endif
+    var data = has_key(message, 'data_b64')
+      ? UnB64(get(message, 'data_b64', ''))
+      : get(message, 'data', '')
+    return {
+      key: string(get(message, 'id', '')),
+      ok: !!get(message, 'ok', false),
+      data: type(data) == v:t_string ? data : string(data),
+    }
+  endif
+  var parts = split(line, "\t", 1)
+  if len(parts) != 3
+    return {}
+  endif
+  return {key: parts[0], ok: parts[1] ==# 'ok', data: UnB64(parts[2])}
+enddef
+
 def OnLine(generation: number, _channel: any, line: string)
   if !IsCurrent(generation)
     return
   endif
-  var parts = split(line, "\t", 1)
-  if len(parts) != 3 || !has_key(s_remote.pending, parts[0])
+  var reply = DecodeLine(line)
+  if empty(reply) || !has_key(s_remote.pending, reply.key)
     return
   endif
-  var entry = remove(s_remote.pending, parts[0])
+  var entry = remove(s_remote.pending, reply.key)
   StopRequestTimer(entry)
+  var data = reply.data
+  if reply.ok && get(s_remote, 'protocol', 'legacy') !=# 'json'
+        && (entry.operation ==# 'read' || entry.operation ==# 'read-config')
+    # The agent base64-encodes file bodies before the protocol layer encodes
+    # the whole reply; the bridge peels that inner layer, legacy Vim must.
+    data = UnB64(data)
+  endif
   var Callback = entry.callback
-  call(Callback, [parts[1] ==# 'ok', UnB64(parts[2])])
+  call(Callback, [reply.ok, data])
 enddef
 
 def OnError(generation: number, _channel: any, line: string)
@@ -181,7 +250,6 @@ def OnExit(generation: number, _job: any, status: number)
   DeactivateWorkspace(remote)
   ClearGlobals()
   FailPending(remote, printf('connection closed (%d)', status))
-  StopSimpleCC(remote)
   var detail = empty(remote.stderr) ? '' : ': ' .. remote.stderr[-1]
   echomsg printf('[VimrcRemote] connection closed (%d)%s', status, detail)
   Emit('SimpleRemoteDisconnected', {reason: 'transport-exit', code: status})
@@ -198,6 +266,97 @@ def DaemonPath(): string
   endif
   var path = fnamemodify(expand(get(g:, 'simpleremote_daemon_path', '')), ':p')
   return executable(path) ? path : ''
+enddef
+
+# What the installed runtime can do, asked once per binary build.  A plugin
+# update that outruns `install.sh` therefore degrades to the runtime's older
+# behaviour instead of failing to connect, and a rebuild is noticed by mtime.
+def RuntimeCapabilities(daemon: string = DaemonPath()): dict<any>
+  if empty(daemon)
+    return {}
+  endif
+  var key = daemon .. "\t" .. getftime(daemon)
+  if has_key(s_runtime_capabilities, key)
+    return s_runtime_capabilities[key]
+  endif
+  var capabilities: dict<any> = {}
+  var output = system(shellescape(daemon) .. ' capabilities')
+  if v:shell_error == 0
+    try
+      var decoded = json_decode(output)
+      if type(decoded) == v:t_dict
+        capabilities = decoded
+      endif
+    catch
+    endtry
+  endif
+  s_runtime_capabilities = {[key]: capabilities}
+  return capabilities
+enddef
+
+# 'json' asks for the bridge, an action name asks whether the runtime has that
+# subcommand, and any other name is a boolean flag of the capabilities object.
+def RuntimeSupports(feature: string): bool
+  var capabilities = RuntimeCapabilities()
+  if feature ==# 'json'
+    return index(get(capabilities, 'agent_protocols', []), 'json') >= 0
+      && get(capabilities, 'bridge_protocol', 0) == BRIDGE_PROTOCOL
+  endif
+  if index(get(capabilities, 'actions', []), feature) >= 0
+    return true
+  endif
+  return !!get(capabilities, feature, false)
+enddef
+
+def RuntimeVersion(): string
+  return get(RuntimeCapabilities(), 'version', '')
+enddef
+
+def AgentSourcePath(): string
+  return get(g:, 'simpleremote_agent_source',
+    SCRIPT_ROOT .. '/bin/simpleremote-agent.sh')
+enddef
+
+const AGENT_HEREDOC = 'SIMPLEREMOTE_AGENT_EOF'
+
+# The remote-side path expression: `~/x` becomes "$HOME"/'x' so the remote
+# shell expands the home directory, anything else is quoted literally.
+def AgentPathExpression(agent: string): string
+  return strpart(agent, 0, 2) ==# '~/'
+    ? '"$HOME"/' .. ShellLiteral(strpart(agent, 2))
+    : ShellLiteral(agent)
+enddef
+
+# The self-installing agent launcher used when the Rust runtime is absent; the
+# runtime builds the identical shape itself from --agent-source.  The bundled
+# agent travels inside a quoted heredoc, is compared with cmp against the
+# installed copy and replaces it atomically only when they differ, so a first
+# connection or a plugin update never needs :SimpleRemoteInstallAgent.  An
+# unwritable destination falls back to whatever agent is already installed.
+def AgentBootstrapScript(agent: string): string
+  var source = AgentSourcePath()
+  var destination = AgentPathExpression(agent)
+  if !filereadable(source)
+    return 'exec ' .. destination
+  endif
+  # Text mode: a final newline must not become an extra empty line, or the
+  # shipped copy would differ from the source by one byte on every connect.
+  var lines = readfile(source)
+  if index(lines, AGENT_HEREDOC) >= 0
+    return 'exec ' .. destination
+  endif
+  return 'dst=' .. destination .. '; dir=$(dirname -- "$dst"); umask 077; '
+    .. 'mkdir -p -- "$dir" 2>/dev/null; '
+    .. 'tmp=$(mktemp "$dir/.simpleremote-agent.XXXXXX" 2>/dev/null) || tmp=; '
+    .. 'if [ -n "$tmp" ]; then '
+    .. 'cat >"$tmp" <<' .. "'" .. AGENT_HEREDOC .. "'\n"
+    .. join(lines, "\n") .. "\n" .. AGENT_HEREDOC .. "\n"
+    .. 'if [ -x "$dst" ] && cmp -s -- "$tmp" "$dst"; then rm -f -- "$tmp"; '
+    .. 'elif chmod 700 -- "$tmp" && mv -f -- "$tmp" "$dst"; then :; '
+    .. 'else rm -f -- "$tmp"; fi; fi; '
+    .. 'if [ -x "$dst" ]; then exec "$dst"; fi; '
+    .. 'printf ' .. "'simpleremote: cannot install agent at %s\\n'"
+    .. ' "$dst" >&2; exit 126'
 enddef
 
 def OnRuntimeProbeLine(generation: number, _channel: any, line: string)
@@ -227,6 +386,12 @@ def OnRuntimeProbeExit(generation: number, _job: any, status: number)
     probe.error = s_remote.runtime_probe_error
   endif
   s_remote.runtime_probe = probe
+  if !IsReady()
+    # Still handshaking: the Connected snapshot will carry the probe, and
+    # publishing g:simpleremote_workspace early would let siblings act on a
+    # workspace that has not been announced yet.
+    return
+  endif
   g:simpleremote_workspace = WorkspaceSnapshot()
   Emit('SimpleRemoteRuntimeReady', copy(g:simpleremote_workspace))
 enddef
@@ -254,38 +419,42 @@ def ShellLiteral(value: string): string
   return shellescape(value)
 enddef
 
-def DockerAgentCommand(agent: string): string
-  if strpart(agent, 0, 2) ==# '~/'
-    return 'exec "$HOME"/' .. ShellLiteral(strpart(agent, 2))
+# 'json'   the runtime bridges JSON lines to the agent protocol
+# 'exec'   an older runtime replaces itself with the transport
+# 'legacy' no runtime: Vim drives ssh/docker and base64 itself
+def TransportProtocol(): string
+  var daemon = DaemonPath()
+  if empty(daemon)
+    return 'legacy'
   endif
-  return 'exec ' .. ShellLiteral(agent)
+  return RuntimeSupports('json') ? 'json' : 'exec'
 enddef
 
 def TargetCommand(kind: string, target: string, agent: string): list<string>
   var daemon = DaemonPath()
-  if !empty(daemon)
+  var protocol = TransportProtocol()
+  if protocol ==# 'json'
+    var command = [daemon, 'agent', '--protocol', 'json', '--kind', kind,
+      '--target', target, '--agent', agent]
+    if filereadable(AgentSourcePath())
+      extend(command, ['--agent-source', AgentSourcePath()])
+    endif
+    return command
+  endif
+  if protocol ==# 'exec'
     return [daemon, 'agent', '--kind', kind, '--target', target,
       '--agent', agent]
   endif
+  var script = AgentBootstrapScript(agent)
   if kind ==# 'docker'
-    return ['docker', 'exec', '-i', target, 'sh', '-c',
-      DockerAgentCommand(agent)]
+    return ['docker', 'exec', '-i', target, 'sh', '-c', script]
   endif
-  var script = 'exec ' .. (strpart(agent, 0, 2) ==# '~/'
-    ? '"$HOME"/' .. ShellLiteral(strpart(agent, 2))
-    : ShellLiteral(agent))
   # OpenSSH joins all arguments after the host into one login-shell command.
   # Quote the complete -c script so that boundary survives that re-serialization.
   return ['ssh', '-T', target, 'sh', '-c', ShellLiteral(script)]
 enddef
 
-def StopSimpleCC(remote: dict<any>)
-  if get(remote, 'simplecc_started', false) && exists(':SimpleCCStop') == 2
-    execute 'silent! SimpleCCStop'
-  endif
-enddef
-
-def Disconnect(show_message: bool = true)
+def Disconnect(show_message: bool = true, reason: string = 'disconnect')
   if s_workspace_switch_timer > 0
     timer_stop(s_workspace_switch_timer)
     s_workspace_switch_timer = 0
@@ -301,15 +470,18 @@ def Disconnect(show_message: bool = true)
   DeactivateWorkspace(remote)
   ClearGlobals()
   FailPending(remote, 'connection closed')
-  StopSimpleCC(remote)
   var job = get(remote, 'job', v:null)
   if job != v:null && job_status(job) ==# 'run'
     job_stop(job, 'term')
   endif
+  var probe_job = get(remote, 'probe_job', v:null)
+  if probe_job != v:null && job_status(probe_job) ==# 'run'
+    job_stop(probe_job, 'term')
+  endif
   if show_message
     echomsg '[SimpleRemote] disconnected'
   endif
-  Emit('SimpleRemoteDisconnected', {reason: 'disconnect'})
+  Emit('SimpleRemoteDisconnected', {reason: reason})
 enddef
 
 def FinishConnection(generation: number)
@@ -325,7 +497,11 @@ def FinishConnection(generation: number)
   echomsg printf('[SimpleRemote] connected %s %s:%s',
     s_remote.kind, s_remote.target, s_remote.root)
   Emit('SimpleRemoteConnected', WorkspaceSnapshot())
-  StartRuntimeProbe(generation)
+  if get(get(s_remote, 'runtime_probe', {}), 'status', -1) != -1
+    # The probe raced ahead of the handshake; announce it now that listeners
+    # may act on the workspace.
+    Emit('SimpleRemoteRuntimeReady', WorkspaceSnapshot())
+  endif
 
   var queued = copy(s_remote.open_queue)
   s_remote.open_queue = []
@@ -347,7 +523,7 @@ def FetchRemoteConfig(generation: number, Completion: func)
   s_remote.state = 'configuring'
   var root = s_remote.root
   var config_path = root ==# '/' ? '/simplecc.json' : root .. '/simplecc.json'
-  Send('read-config', config_path, (ok, body) => {
+  Send('read-config', {path: config_path}, (ok, body) => {
     if !IsCurrent(generation) || s_remote.config_epoch != config_epoch
       return
     endif
@@ -362,7 +538,7 @@ def FetchRemoteConfig(generation: number, Completion: func)
       endif
       return
     endif
-    var config = UnB64(body)
+    var config = body
     try
       json_decode(config)
       g:vimrc_remote_simplecc_config = config
@@ -387,7 +563,10 @@ def Connect(kind: string, target: string, root: string,
     return
   endif
 
-  Disconnect(false)
+  # A connection replaced by another is reported as 'reconnect', so consumers
+  # such as SimpleFinder can keep their state instead of flashing an error
+  # between the Disconnected and Connected events of a workspace switch.
+  Disconnect(false, empty(s_remote) ? 'disconnect' : 'reconnect')
   s_connect_spec = copy(options)
   s_generation += 1
   var generation = s_generation
@@ -418,13 +597,12 @@ def Connect(kind: string, target: string, root: string,
     connection_announced: false,
     open_queue: [],
     config_epoch: 0,
-    simplecc_started: false,
-    simplecc_restart_pending: false,
     options: copy(options),
     local_root: '',
     workspace_mode: 'virtual',
     mount_owned: false,
     mount_job: v:null,
+    protocol: TransportProtocol(),
   }
   s_last_spec = extend(copy(options), {
     kind: kind,
@@ -437,7 +615,7 @@ def Connect(kind: string, target: string, root: string,
   unlet! g:simpleremote_workspace
   Emit('SimpleRemoteConnecting', copy(s_last_spec))
 
-  Send('ping', '', (ok, body) => {
+  Send('ping', {}, (ok, body) => {
     if !IsCurrent(generation)
       return
     endif
@@ -449,6 +627,10 @@ def Connect(kind: string, target: string, root: string,
     endif
     s_remote.handshake_ready = true
     g:vimrc_remote_workspace = {kind: kind, target: target, root: s_remote.root}
+    # The environment probe and the config fetch are independent round trips;
+    # starting the probe here means the Connected snapshot usually already
+    # carries it, without making the connection wait for it.
+    StartRuntimeProbe(generation)
     FetchRemoteConfig(generation, (_) => FinishConnection(generation))
   })
 enddef
@@ -461,88 +643,32 @@ def RemoteLines(content: string): list<string>
   return empty(lines) ? [''] : lines
 enddef
 
+# Language plugins (SimpleCC, SimpleTreesitter, SimpleMarkdown) attach on
+# FileType, which only fires once the buffer has a filetype; a background read
+# would otherwise leave a visible buffer undetected until it is re-entered.
 def DetectRemoteFiletype(buf: number)
-  if bufnr() == buf && &filetype ==# ''
+  if getbufvar(buf, '&filetype') !=# ''
+    return
+  endif
+  if bufnr() == buf
     filetype detect
+    return
+  endif
+  var winid = bufwinid(buf)
+  if winid > 0
+    win_execute(winid, 'filetype detect')
   endif
 enddef
 
-def NotifySimpleCCWhenReady(generation: number, attempts: number)
-  if !IsCurrent(generation) || attempts <= 0
-    return
-  endif
-  if get(g:, 'simplecc_status', '') ==# 'ready'
-    var seen: dict<bool> = {}
-    for win in getwininfo()
-      var key = string(win.bufnr)
-      var info = getbufvar(win.bufnr, 'vimrc_remote', {})
-      if !has_key(seen, key)
-            && get(info, 'generation', -1) == generation
-        seen[key] = true
-        win_execute(win.winid, 'silent! call simplecc#OnBufOpen()')
-      endif
-    endfor
-    return
-  endif
-  timer_start(100, (_) => NotifySimpleCCWhenReady(generation, attempts - 1))
-enddef
-
-def RemoteContextBuffer(preferred: number, generation: number): number
-  if preferred > 0 && bufname(preferred) =~# '^remote://'
-        && get(getbufvar(preferred, 'vimrc_remote', {}),
-          'generation', -1) == generation
-        && (bufnr() == preferred || bufwinid(preferred) > 0)
-    return preferred
-  endif
-  for win in getwininfo()
-    if bufname(win.bufnr) =~# '^remote://'
-          && get(getbufvar(win.bufnr, 'vimrc_remote', {}),
-            'generation', -1) == generation
-      return win.bufnr
-    endif
-  endfor
-  return -1
-enddef
-
-def RestartSimpleCC(generation: number, buf: number)
-  if !IsCurrent(generation) || exists(':SimpleCCRestart') != 2
-    return
-  endif
-  var context = RemoteContextBuffer(buf, generation)
-  if context < 0
-    s_remote.simplecc_restart_pending = true
-    return
-  endif
-  var winid = bufwinid(context)
-  if bufnr() == context
+# A remote simplecc.json changed under an established connection.  SimpleCC
+# listens for the event; the :SimpleCCRestart fallback keeps an older SimpleCC
+# reloading the way it always did.
+def AnnounceConfigChanged()
+  var payload = {config: get(g:, 'vimrc_remote_simplecc_config', '')}
+  if exists('#User#SimpleRemoteConfigChanged') == 1
+    Emit('SimpleRemoteConfigChanged', payload)
+  elseif exists(':SimpleCCRestart') == 2
     execute 'silent! SimpleCCRestart'
-  elseif winid > 0
-    win_execute(winid, 'silent! SimpleCCRestart')
-  else
-    s_remote.simplecc_restart_pending = true
-    return
-  endif
-  s_remote.simplecc_started = true
-  s_remote.simplecc_restart_pending = false
-  NotifySimpleCCWhenReady(generation, 600)
-enddef
-
-def MaybeStartSimpleCC(buf: number)
-  if !IsReady() || bufname(buf) !~# '^remote://'
-    return
-  endif
-  var info = getbufvar(buf, 'vimrc_remote', {})
-  if get(info, 'generation', -1) != s_remote.generation
-    return
-  endif
-  if !get(s_remote, 'simplecc_started', false)
-        || get(s_remote, 'simplecc_restart_pending', false)
-    RestartSimpleCC(s_remote.generation, buf)
-  elseif get(g:, 'simplecc_status', '') ==# 'ready'
-    var winid = bufwinid(buf)
-    if winid > 0
-      win_execute(winid, 'silent! call simplecc#OnBufOpen()')
-    endif
   endif
 enddef
 
@@ -598,7 +724,7 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     return
   endif
 
-  var content = UnB64(body)
+  var content = body
   var lines = RemoteLines(content)
   var old_count = len(getbufline(buf, 1, '$'))
   setbufline(buf, 1, lines)
@@ -614,15 +740,15 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     generation: generation,
   })
   setbufvar(buf, '&modified', 0)
-  MaybeStartSimpleCC(buf)
   DetectRemoteFiletype(buf)
-  g:simpleremote_event = {
+  # `type` and `bufnr` are the documented payload (SimpleEditorConfig keys on
+  # them); Emit adds event/status/time like every other SimpleRemote event.
+  Emit('SimpleRemoteBufferRead', {
     type: 'buffer-read',
     bufnr: buf,
     path: remote_path,
     workspace: copy(get(g:, 'simpleremote_workspace', {})),
-  }
-  silent! doautocmd <nomodeline> User SimpleRemoteBufferRead
+  })
 enddef
 
 def ReadRemote(uri: string)
@@ -634,7 +760,7 @@ def ReadRemote(uri: string)
   var generation = s_remote.generation
   var remote_path = substitute(uri, '^remote://', '', '')
   var request_id = 0
-  request_id = Send('read', remote_path, (ok, body) =>
+  request_id = Send('read', {path: remote_path}, (ok, body) =>
     ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body))
   if request_id >= 0
     setbufvar(buf, 'vimrc_remote_read', {
@@ -703,13 +829,18 @@ def WriteRemote(buf: number = bufnr())
     Error('[VimrcRemote] buffer belongs to an old connection; reopen it first')
     return
   endif
+  # BufWriteCmd suppresses Vim's own BufWritePre; fire it so trailing
+  # whitespace trimming, format-on-save and friends see remote saves too.
+  if buf == bufnr()
+    silent doautocmd <nomodeline> BufWritePre
+  endif
   var content = join(getbufline(buf, 1, '$'), "\n")
   if BufferHasFinalEol(buf)
     content ..= "\n"
   endif
   var tick = getbufvar(buf, 'changedtick', -1)
   var final_eol = BufferHasFinalEol(buf)
-  Send('write', info.path .. "\t" .. B64(content), (ok, body) =>
+  Send('write', {path: info.path, content: content}, (ok, body) =>
     FinishRemoteWrite(buf, generation, tick, final_eol, ok, body))
 enddef
 
@@ -719,7 +850,7 @@ def RemoteExec(command: string)
     return
   endif
   var root = s_remote.root
-  Send('exec', 'cd ' .. shellescape(root) .. ' && ' .. command,
+  Send('exec', {command: 'cd ' .. shellescape(root) .. ' && ' .. command},
     (ok, body) => {
       if ok
         echomsg body
@@ -733,7 +864,7 @@ def RemoteFind(query: string)
   var root = s_remote.root
   var command = 'rg --files --hidden --glob ' .. shellescape('!.git/*')
         .. ' | rg --smart-case -- ' .. shellescape(query)
-  Send('grep', 'cd ' .. shellescape(root) .. ' && ' .. command,
+  Send('grep', {command: 'cd ' .. shellescape(root) .. ' && ' .. command},
     (ok, body) => {
       if !ok && !empty(body)
         Error('[VimrcRemote] ' .. body)
@@ -753,7 +884,7 @@ enddef
 def RemoteList(path: string)
   var remote_path = path ==# '' ? s_remote.root
         : path =~# '^/' ? path : JoinRemotePath(s_remote.root, path)
-  Send('list', remote_path, (ok, body) => {
+  Send('list', {path: remote_path}, (ok, body) => {
     if !ok
       Error('[VimrcRemote] ' .. body)
       return
@@ -783,7 +914,7 @@ def RemoteHealth()
   var command = 'cd ' .. shellescape(root)
         .. ' && { printf "host=%s\\npwd=%s\\n" "$(hostname 2>/dev/null || true)" "$PWD"; '
         .. 'command -v git || true; command -v rg || true; }'
-  Send('exec', command, (ok, body) => {
+  Send('exec', {command: command}, (ok, body) => {
     if ok
       echomsg '[VimrcRemote] ' .. body
     else
@@ -794,7 +925,7 @@ enddef
 
 def RemoteGit(command: string)
   var root = s_remote.root
-  Send('exec', 'cd ' .. shellescape(root) .. ' && git ' .. command,
+  Send('exec', {command: 'cd ' .. shellescape(root) .. ' && git ' .. command},
     (ok, body) => {
       if !ok
         Error('[VimrcRemote] ' .. body)
@@ -828,6 +959,8 @@ def WorkspaceSnapshot(): dict<any>
     local_root: get(s_remote, 'local_root', ''),
     mode: get(s_remote, 'workspace_mode', 'virtual'),
     runtime: DaemonPath(),
+    runtime_version: RuntimeVersion(),
+    protocol: get(s_remote, 'protocol', 'legacy'),
     probe: get(s_remote, 'runtime_probe', {}),
     uri: 'remote://' .. get(s_remote, 'root', ''),
   }
@@ -1523,7 +1656,7 @@ def LoadTreeGit()
     .. ' && if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then '
     .. 'git -c core.quotepath=false status --porcelain=v1 '
     .. '--untracked-files=all --ignored=matching; fi'
-  Send('exec', command,
+  Send('exec', {command: command},
     (ok, body) => OnTreeGit(generation, epoch, ok, body))
 enddef
 
@@ -1771,7 +1904,7 @@ def LoadTreeDirectory(path: string, force: bool = false)
   var metadata = index(['mtime', 'size'], TreeSortMode()) >= 0
     && get(s_tree, 'metadata_supported', -1) != 0
   RenderRemoteTree(buf)
-  Send(metadata ? 'list-meta' : 'list', path,
+  Send(metadata ? 'list-meta' : 'list', {path: path},
     (ok, body) => OnTreeList(generation, epoch, buf, path, metadata, ok, body))
 enddef
 
@@ -2062,7 +2195,8 @@ def RemoteTreeHelp()
     '  a / n        create file in target directory',
     '  A / N        create folder in target directory',
     '  r / D        rename / delete remote nodes',
-    '  gd           download file into local SimpleTree',
+    '  gd           download file/directory into local SimpleTree',
+    '  gu           upload a local file/directory here',
     '  gy           copy remote file contents',
     '  y / Y        copy file name / absolute remote path',
     '',
@@ -2104,6 +2238,24 @@ def RemoteTreeHelp()
   for line in lines
     echomsg line
   endfor
+enddef
+
+# Names for the multi-key tree mappings in SimpleWhichKey's panel; the tree
+# buffer is wiped on close, so the buffer-scoped registration dies with it.
+def DescribeTreeKeys()
+  if exists('*simplewhichkey#Describe') != 1
+    return
+  endif
+  try
+    simplewhichkey#Describe({
+      gs: 'reverse sort', gm: 'mark siblings', gM: 'clear marks',
+      gy: 'copy file contents', gd: 'download to local tree',
+      gu: 'upload local file here',
+      ']f': 'next find match', '[f': 'previous find match',
+      ']b': 'next bookmark', '[b': 'previous bookmark',
+    }, 'n', true)
+  catch
+  endtry
 enddef
 
 def RemoteTreeToggleHidden()
@@ -2341,14 +2493,46 @@ def RemoteTreeNew(directory: bool)
     .. ' >&2; exit 47; fi; mkdir -p ' .. target_parent
     .. (directory ? ' && mkdir ' .. quoted : ' && : > ' .. quoted)
   var generation = s_remote.generation
-  Send('exec', command, (ok, body) => RemoteTreeMutationFinished(
-    generation, directory ? 'created folder' : 'created file',
-    target, !directory, ok, body))
+  Send('exec', {command: command}, (ok, body) => {
+    if ok && IsCurrent(generation)
+      AnnounceFilesChanged([{path: target, type: 'created'}])
+    endif
+    RemoteTreeMutationFinished(generation,
+      directory ? 'created folder' : 'created file', target, !directory,
+      ok, body)
+  })
 enddef
 
 def RewriteRemotePath(path: string, source: string, target: string): string
   return path ==# source ? target
     : UnderRoot(path, source) ? target .. strpart(path, len(source)) : path
+enddef
+
+# Give a remote buffer the name its b:vimrc_remote.uri says it has.  `:file`
+# needs the buffer to be current, so a visible buffer is renamed through its
+# window and a hidden one waits for its next BufEnter (see
+# g:VimrcRemoteActivateBuffer).  The unlisted buffer Vim keeps for the old
+# name is wiped so it cannot be picked up as a stale remote:// entry.
+def SyncRemoteBufferName(buf: number)
+  var info = getbufvar(buf, 'vimrc_remote', {})
+  var uri = type(info) == v:t_dict ? get(info, 'uri', '') : ''
+  if empty(uri) || bufname(buf) ==# uri
+    return
+  endif
+  var old_name = bufname(buf)
+  var winid = bufwinid(buf)
+  if buf == bufnr()
+    execute 'silent! keepalt file ' .. fnameescape(uri)
+  elseif winid > 0
+    win_execute(winid, 'silent! keepalt file ' .. fnameescape(uri))
+  else
+    return
+  endif
+  var stale = bufnr('^' .. old_name .. '$')
+  if stale > 0 && stale != buf && !buflisted(stale)
+        && !getbufvar(stale, '&modified')
+    execute 'silent! bwipeout ' .. stale
+  endif
 enddef
 
 def RetargetRemoteBuffers(source: string, target: string)
@@ -2364,7 +2548,21 @@ def RetargetRemoteBuffers(source: string, target: string)
     remote.uri = 'remote://' .. updated
     setbufvar(info.bufnr, 'vimrc_remote', remote)
     setbufvar(info.bufnr, 'simpleremote_path', updated)
+    SyncRemoteBufferName(info.bufnr)
   endfor
+enddef
+
+# Announce filesystem changes made outside buffer writes (tree mutations,
+# uploads, API writes) so language servers and other watchers can follow.
+# Each change is {path, type} with type 'created', 'changed' or 'deleted'.
+def AnnounceFilesChanged(changes: list<dict<any>>)
+  if empty(changes) || empty(s_remote)
+    return
+  endif
+  Emit('SimpleRemoteFilesChanged', {
+    changes: changes,
+    workspace: copy(get(g:, 'simpleremote_workspace', {})),
+  })
 enddef
 
 def RewriteRemoteTreeMaps(source: string, target: string)
@@ -2417,10 +2615,12 @@ def RemoteTreeRename()
     .. quoted_target .. ' >&2; exit 47; fi; mv ' .. shellescape(source)
     .. ' ' .. quoted_target
   var generation = s_remote.generation
-  Send('exec', command, (ok, body) => {
+  Send('exec', {command: command}, (ok, body) => {
     if ok && IsCurrent(generation)
       RetargetRemoteBuffers(source, target)
       RewriteRemoteTreeMaps(source, target)
+      AnnounceFilesChanged([{path: source, type: 'deleted'},
+        {path: target, type: 'created'}])
     endif
     RemoteTreeMutationFinished(generation, 'renamed', target, false, ok, body)
   })
@@ -2546,15 +2746,23 @@ def RemoteTreePaste()
       .. shellescape(source) .. ' ' .. quoted_target)
   endfor
   var generation = s_remote.generation
-  Send('exec', join(['set -e'] + checks + operations, '; '), (ok, body) => {
-    if ok && IsCurrent(generation) && mode ==# 'cut'
+  Send('exec', {command: join(['set -e'] + checks + operations, '; ')}, (ok, body) => {
+    if ok && IsCurrent(generation)
+      var changes: list<dict<any>> = []
       for item in get(s_tree_clipboard, 'items', [])
         var moved = JoinRemotePath(destination, fnamemodify(item.path, ':t'))
-        RetargetRemoteBuffers(item.path, moved)
-        RewriteRemoteTreeMaps(item.path, moved)
+        if mode ==# 'cut'
+          RetargetRemoteBuffers(item.path, moved)
+          RewriteRemoteTreeMaps(item.path, moved)
+          add(changes, {path: item.path, type: 'deleted'})
+        endif
+        add(changes, {path: moved, type: 'created'})
       endfor
-      s_tree_clipboard = {}
-      s_tree.marked = {}
+      AnnounceFilesChanged(changes)
+      if mode ==# 'cut'
+        s_tree_clipboard = {}
+        s_tree.marked = {}
+      endif
     endif
     RemoteTreeMutationFinished(generation,
       mode ==# 'cut' ? 'moved' : 'pasted', destination, false, ok, body)
@@ -2601,8 +2809,10 @@ def RemoteTreeDelete()
     add(commands, 'rm -rf ' .. shellescape(node.path))
   endfor
   var generation = s_remote.generation
-  Send('exec', join(commands, '; '), (ok, body) => {
+  Send('exec', {command: join(commands, '; ')}, (ok, body) => {
     if ok && IsCurrent(generation)
+      AnnounceFilesChanged(mapnew(nodes,
+        (_, node) => ({path: node.path, type: 'deleted'})))
       s_tree.marked = {}
       LoadTreeBookmarks()
       for node in nodes
@@ -2793,7 +3003,7 @@ def OnRemoteContentRead(path: string, ok: bool, body: string)
     Error('[SimpleRemote] cannot copy file contents: ' .. body)
     return
   endif
-  var content = UnB64(body)
+  var content = body
   var configured = get(g:, 'simpleremote_clipboard_max_bytes', 1024 * 1024)
   var limit = type(configured) == v:t_number && configured >= 0
     ? configured : 1024 * 1024
@@ -2816,7 +3026,7 @@ def CopyRemoteTreeContents()
     Error('[SimpleRemote] directory contents cannot be copied to the text clipboard')
     return
   endif
-  Send('read', node.path,
+  Send('read', {path: node.path},
     (ok, body) => OnRemoteContentRead(node.path, ok, body))
   echomsg '[SimpleRemote] reading ' .. node.path
 enddef
@@ -2839,23 +3049,163 @@ def LocalCopyDirectory(): string
   return ''
 enddef
 
-def FinishCopyOut(remote_path: string, local_path: string,
-    errors: list<string>, status: number)
-  if status != 0
-    Error(printf('[SimpleRemote] copy failed (%d): %s', status,
-      empty(errors) ? remote_path : errors[-1]))
-    return
+# ---------------------------------------------------------------------------
+# Cross-boundary transfers.  One engine serves the tree keys (gd/gu), the
+# commands (:SimpleRemoteDownload/:SimpleRemoteUpload) and the public API that
+# sibling plugins call.  With the Rust runtime present, files and directories
+# stream through `simpleremote-daemon download|upload`, which stages beside
+# the destination and activates it atomically; without it, scp/docker cp do
+# the same job with their own semantics.
+# ---------------------------------------------------------------------------
+
+def RuntimeHandlesTransfer(direction: string, options: dict<any>): bool
+  var recursive = !!get(options, 'recursive', false)
+  return !empty(DaemonPath())
+    && (direction ==# 'download' || RuntimeSupports('upload'))
+    && (!recursive || RuntimeSupports('recursive_transfer'))
+enddef
+
+def TransferCommand(direction: string, remote: string, local: string,
+    options: dict<any>): list<string>
+  var force = !!get(options, 'force', false)
+  var recursive = !!get(options, 'recursive', false)
+  var daemon = DaemonPath()
+  if RuntimeHandlesTransfer(direction, options)
+    var command = [daemon, direction, '--kind', s_remote.kind,
+      '--target', s_remote.target, '--root', s_remote.root,
+      '--remote', remote, '--local', local]
+    if !UnderRoot(remote, s_remote.root)
+      add(command, '--allow-outside-root')
+    endif
+    if force
+      add(command, '--force')
+    endif
+    if recursive
+      add(command, '--recursive')
+    endif
+    return command
   endif
-  var copied = CopyText(local_path)
-  echomsg printf('[SimpleRemote] copied %s -> %s%s', remote_path, local_path,
-    copied ? '' : ' (path in unnamed register)')
-  Emit('SimpleRemoteFileCopied', {
-    remote: remote_path,
-    local: local_path,
+  var endpoint = s_remote.target .. ':' .. remote
+  if s_remote.kind ==# 'docker'
+    return direction ==# 'download'
+      ? ['docker', 'cp', endpoint, local]
+      : ['docker', 'cp', local, endpoint]
+  endif
+  var scp = ['scp', '-q'] + (recursive ? ['-r'] : [])
+  return direction ==# 'download'
+    ? scp + [endpoint, local]
+    : scp + [local, endpoint]
+enddef
+
+def FinishTransfer(direction: string, remote: string, local: string,
+    errors: list<string>, Callback: func, status: number)
+  var ok = status == 0
+  var detail = empty(errors) ? '' : errors[-1]
+  var result = {
+    direction: direction,
+    remote: remote,
+    local: local,
+    status: status,
+    error: ok ? '' : (empty(detail) ? printf('exit status %d', status) : detail),
+  }
+  if !ok
+    if Callback == null_function
+      Error(printf('[SimpleRemote] %s failed (%d): %s', direction, status,
+        empty(detail) ? remote : detail))
+    endif
+  elseif direction ==# 'download'
+    if Callback == null_function
+      var copied = CopyText(local)
+      echomsg printf('[SimpleRemote] copied %s -> %s%s', remote, local,
+        copied ? '' : ' (path in unnamed register)')
+    endif
+    Emit('SimpleRemoteFileCopied', {remote: remote, local: local})
+    if SimpleTreeVisible() && exists('*simpletree#GetRoot') == 1
+          && exists(':SimpleTreeReveal') == 2
+          && UnderRoot(local, simpletree#GetRoot())
+      silent! execute 'SimpleTreeReveal ' .. fnameescape(local)
+    elseif exists(':SimpleTreeRefresh') == 2
+      silent! execute 'SimpleTreeRefresh'
+    endif
+  else
+    if Callback == null_function
+      echomsg printf('[SimpleRemote] uploaded %s -> %s', local, remote)
+    endif
+    Emit('SimpleRemoteFileUploaded', {remote: remote, local: local})
+    AnnounceFilesChanged([{path: remote, type: 'created'}])
+    if !empty(s_tree) && bufexists(get(s_tree, 'buf', -1))
+      s_tree.reveal = remote
+      ReloadRemoteTree()
+    endif
+  endif
+  if Callback != null_function
+    call(Callback, [ok, result])
+  endif
+enddef
+
+# Start a transfer job.  Returns false when nothing was started (and the
+# callback, if any, has already been told why).
+def StartTransfer(direction: string, remote: string, local: string,
+    options: dict<any> = {}, Callback: func = null_function): bool
+  if !IsReady()
+    if Callback != null_function
+      call(Callback, [false, {error: 'remote workspace is not ready'}])
+    else
+      Error('[SimpleRemote] not connected')
+    endif
+    return false
+  endif
+  if direction ==# 'upload' && !get(options, 'force', false)
+        && !RuntimeHandlesTransfer(direction, options)
+    # scp and docker cp overwrite silently; the runtime refuses an existing
+    # destination unless forced, and the fallback must keep that promise.
+    var probe = 'if [ -e ' .. shellescape(remote) .. ' ] || [ -L '
+      .. shellescape(remote) .. ' ]; then echo exists; fi'
+    var settings = extend(copy(options), {force: true})
+    Send('exec', {command: probe}, (ok, body) => {
+      if ok && trim(body) ==# 'exists'
+        FinishTransfer(direction, remote, local,
+          ['remote destination already exists: ' .. remote], Callback, 47)
+      else
+        StartTransfer(direction, remote, local, settings, Callback)
+      endif
+    })
+    return true
+  endif
+  var command = TransferCommand(direction, remote, local, options)
+  var errors: list<string> = []
+  var job = job_start(command, {
+    in_io: 'null', out_io: 'null', err_io: 'pipe', err_mode: 'nl',
+    err_cb: (_channel, line) => {
+      if !empty(line)
+        add(errors, line)
+      endif
+    },
+    exit_cb: (_job, status) =>
+      FinishTransfer(direction, remote, local, errors, Callback, status),
   })
-  if exists(':SimpleTreeRefresh') == 2
-    silent! execute 'SimpleTreeRefresh'
+  if job_status(job) ==# 'fail'
+    if Callback != null_function
+      call(Callback, [false, {error: 'cannot start ' .. direction}])
+    else
+      Error('[SimpleRemote] cannot start ' .. direction)
+    endif
+    return false
   endif
+  if Callback == null_function
+    echomsg direction ==# 'download'
+      ? printf('[SimpleRemote] downloading %s -> %s', remote, local)
+      : printf('[SimpleRemote] uploading %s -> %s', local, remote)
+  endif
+  return true
+enddef
+
+def NormalizeRemoteTarget(path: string): string
+  var remote = substitute(path, '^remote://', '', '')
+  if remote !~# '^/'
+    remote = JoinRemotePath(s_remote.root, remote)
+  endif
+  return NormalizeTreeRoot(remote)
 enddef
 
 def CopyRemoteTreeFileOut()
@@ -2867,68 +3217,117 @@ def CopyRemoteTreeFileOut()
   if empty(node) || empty(get(node, 'path', ''))
     return
   endif
-  if get(node, 'type', '') ==# 'd'
-    Error('[SimpleRemote] recursive directory copy is not supported yet')
-    return
-  endif
+  var recursive = get(node, 'type', '') ==# 'd'
   var directory = LocalCopyDirectory()
   var destination = empty(directory) ? ''
     : substitute(directory, '[\\/]\+$', '', '') .. '/' .. fnamemodify(node.path, ':t')
   if empty(destination) || get(g:, 'simpleremote_copy_prompt', 0)
-    destination = input('Copy remote file to: ',
+    destination = input(recursive ? 'Copy remote directory to: '
+      : 'Copy remote file to: ',
       empty(destination) ? expand('~/') .. fnamemodify(node.path, ':t') : destination,
       'file')
   endif
   if empty(destination)
     return
   endif
-  destination = fnamemodify(destination, ':p')
+  destination = substitute(fnamemodify(destination, ':p'), '[\\/]\+$', '', '')
   var force = false
   if filereadable(destination) || isdirectory(destination)
-    if isdirectory(destination)
+    if isdirectory(destination) && !recursive
       Error('[SimpleRemote] destination is a directory: ' .. destination)
       return
     endif
-    force = confirm('Replace local file?\n' .. destination,
-      "&Replace\n&Cancel", 2) == 1
+    force = confirm('Replace local ' .. (recursive ? 'directory' : 'file')
+      .. "?\n" .. destination, "&Replace\n&Cancel", 2) == 1
     if !force
       return
     endif
   endif
-  var daemon = DaemonPath()
-  var command: list<string>
-  if !empty(daemon)
-    command = [daemon, 'download', '--kind', s_remote.kind,
-      '--target', s_remote.target, '--root', s_remote.root,
-      '--remote', node.path, '--local', destination]
-    if !UnderRoot(node.path, s_remote.root)
-      add(command, '--allow-outside-root')
-    endif
-    if force
-      add(command, '--force')
-    endif
-  elseif s_remote.kind ==# 'docker'
-    command = ['docker', 'cp', s_remote.target .. ':' .. node.path, destination]
-  else
-    command = ['scp', s_remote.target .. ':' .. node.path, destination]
+  StartTransfer('download', node.path, destination,
+    {force: force, recursive: recursive})
+enddef
+
+# The local source of an upload: SimpleTree's selected node when a tree is
+# showing, otherwise a prompt.
+def LocalUploadSource(): string
+  var selected = ''
+  if exists('*simpletree#ExternalSelectedPath') == 1
+    try
+      selected = simpletree#ExternalSelectedPath()
+    catch
+      selected = ''
+    endtry
   endif
-  var errors: list<string> = []
-  var remote_path = node.path
-  var job = job_start(command, {
-    in_io: 'null', out_io: 'null', err_io: 'pipe', err_mode: 'nl',
-    err_cb: (_channel, line) => {
-      if !empty(line)
-        add(errors, line)
-      endif
-    },
-    exit_cb: (_job, status) =>
-      FinishCopyOut(remote_path, destination, errors, status),
-  })
-  if job_status(job) ==# 'fail'
-    Error('[SimpleRemote] cannot start file copy')
+  var source = input('Upload local path: ',
+    empty(selected) ? '' : selected, 'file')
+  return empty(source) ? '' : substitute(fnamemodify(source, ':p'), '[\\/]\+$', '', '')
+enddef
+
+def UploadFinished(local: string, remote: string, recursive: bool,
+    ok: bool, result: dict<any>)
+  if ok
+    echomsg printf('[SimpleRemote] uploaded %s -> %s', local, remote)
     return
   endif
-  echomsg printf('[SimpleRemote] copying %s -> %s', node.path, destination)
+  var error = get(result, 'error', '')
+  if error =~# 'already exists'
+    if confirm('Replace remote ' .. (recursive ? 'directory' : 'file')
+        .. "?\n" .. remote, "&Replace\n&Cancel", 2) == 1
+      StartTransfer('upload', remote, local, {force: true, recursive: recursive})
+    endif
+    return
+  endif
+  Error('[SimpleRemote] upload failed: ' .. error)
+enddef
+
+def UploadToRemote(local: string, remote_directory: string)
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  if empty(local) || (!filereadable(local) && !isdirectory(local))
+    Error('[SimpleRemote] local path is not a file or directory: ' .. local)
+    return
+  endif
+  var recursive = isdirectory(local)
+  var remote = JoinRemotePath(NormalizeRemoteTarget(remote_directory),
+    fnamemodify(local, ':t'))
+  StartTransfer('upload', remote, local, {recursive: recursive},
+    (ok, result) => UploadFinished(local, remote, recursive, ok, result))
+enddef
+
+def UploadIntoRemoteTree()
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  var directory = RemoteTreeTargetDirectory()
+  var local = LocalUploadSource()
+  if empty(local)
+    return
+  endif
+  UploadToRemote(local, directory)
+enddef
+
+# The window remote files open in: the current one when it holds an ordinary
+# or remote buffer, otherwise the first such window in the tab, so a file
+# never lands in a minimap, tree, or quickfix split.
+def EditableWindow(): number
+  var special = ['simpleminimap', 'simpletree', 'simpleremotetree', 'qf', 'help']
+  if (&buftype ==# '' || &buftype ==# 'acwrite') && index(special, &filetype) < 0
+    return win_getid()
+  endif
+  for window in getwininfo()
+    if window.tabnr != tabpagenr()
+      continue
+    endif
+    var buftype = getbufvar(window.bufnr, '&buftype')
+    if (buftype ==# '' || buftype ==# 'acwrite')
+          && index(special, getbufvar(window.bufnr, '&filetype')) < 0
+      return window.winid
+    endif
+  endfor
+  return 0
 enddef
 
 def OpenRemoteTree(path: string, reveal: string = '')
@@ -2946,7 +3345,10 @@ def OpenRemoteTree(path: string, reveal: string = '')
     LoadRemoteTree(path)
     return
   endif
-  var source_win = win_getid()
+  var source_win = EditableWindow()
+  if source_win == 0
+    source_win = win_getid()
+  endif
   var width = max([24, get(g:, 'simpleremote_tree_width', 40)])
   execute 'silent keepalt leftabove vnew ' .. fnameescape('[SimpleRemote]')
   execute 'vertical resize ' .. width
@@ -3014,6 +3416,8 @@ def OpenRemoteTree(path: string, reveal: string = '')
   nnoremap <silent><buffer> Y <Cmd>call g:SimpleRemoteTreeYank(1)<CR>
   nnoremap <silent><buffer> gy <Cmd>call g:SimpleRemoteTreeCopyContents()<CR>
   nnoremap <silent><buffer> gd <Cmd>call g:SimpleRemoteTreeCopyOut()<CR>
+  nnoremap <silent><buffer> gu <Cmd>call g:SimpleRemoteTreeUpload()<CR>
+  DescribeTreeKeys()
   s_tree = {
     buf: buf,
     source_win: source_win,
@@ -3124,6 +3528,10 @@ def RemoteTreeActivate(action: string)
     win_gotoid(source_win)
   else
     wincmd p
+    var editable = EditableWindow()
+    if editable > 0
+      win_gotoid(editable)
+    endif
     s_tree.source_win = win_getid()
   endif
   if action ==# 'edit'
@@ -3199,11 +3607,6 @@ def OpenRemoteUI()
   else
     RemoteActions(inputlist(['SimpleRemote:'] + actions))
   endif
-enddef
-
-def AgentSourcePath(): string
-  return fnamemodify(expand('<sfile>:p'), ':h:h')
-    .. '/bin/simpleremote-agent.sh'
 enddef
 
 def InstallAgent(spec: dict<any>)
@@ -3291,10 +3694,15 @@ def g:SimpleRemoteShowStatus()
     workspace.kind, workspace.target, workspace.root, workspace.mode,
     empty(workspace.local_root) ? '' : ' -> ' .. workspace.local_root,
     empty(latency) ? '' : '  ' .. latency .. 'ms')
+  echomsg printf('[SimpleRemote] transport=%s runtime=%s',
+    workspace.protocol,
+    empty(workspace.runtime) ? 'none'
+      : (empty(workspace.runtime_version) ? 'unknown' : workspace.runtime_version))
   if !empty(probe)
-    echomsg printf('[SimpleRemote] host=%s python=%s lsp=%s',
+    echomsg printf('[SimpleRemote] host=%s python=%s lsp=%s%s',
       get(probe, 'host', '?'), get(probe, 'python', 'missing'),
-      get(probe, 'python_lsp', 'missing'))
+      get(probe, 'python_lsp', 'missing'),
+      empty(get(probe, 'uname', '')) ? '' : ' os=' .. probe.uname)
   endif
 enddef
 
@@ -3560,17 +3968,25 @@ def g:SimpleRemoteTerminalSpec(argument: string = ''): dict<any>
     return {}
   endif
   var command: list<string>
-  if s_remote.kind ==# 'docker'
+  var daemon = DaemonPath()
+  var shell = empty(argument)
+    ? 'exec "${SHELL:-sh}" -l'
+    : 'exec "${SHELL:-sh}" -lc ' .. shellescape(argument)
+  if !empty(daemon) && RuntimeSupports('tty')
+    # The runtime shares the ControlMaster connection and applies the same
+    # PATH prelude the language servers get, so the shell sees .venv/bin,
+    # ~/.local/bin and friends without sourcing anything itself.
+    command = [daemon, 'exec', '--tty', '--kind', s_remote.kind,
+      '--target', s_remote.target, '--root', s_remote.root,
+      '--', 'sh', '-c', shell]
+  elseif s_remote.kind ==# 'docker'
     command = ['docker', 'exec', '-it', '-w', s_remote.root, s_remote.target,
       'sh']
     if !empty(argument)
       extend(command, ['-lc', argument])
     endif
   else
-    var script = 'cd ' .. shellescape(s_remote.root) .. ' && '
-    script ..= empty(argument)
-      ? 'exec "${SHELL:-sh}" -l'
-      : 'exec "${SHELL:-sh}" -lc ' .. shellescape(argument)
+    var script = 'cd ' .. shellescape(s_remote.root) .. ' && ' .. shell
     command = ['ssh', '-t', s_remote.target, 'sh', '-lc', ShellLiteral(script)]
   endif
   return {
@@ -3583,16 +3999,16 @@ def g:SimpleRemoteTerminalSpec(argument: string = ''): dict<any>
   }
 enddef
 
-def g:SimpleRemoteTerminal()
+def g:SimpleRemoteTerminal(command: string = '')
   if !IsReady()
     Error('[SimpleRemote] not connected')
     return
   endif
   if exists(':SimpleTerminalNew') == 2
-    execute 'SimpleTerminalNew'
+    execute 'SimpleTerminalNew ' .. command
     return
   endif
-  var spec = g:SimpleRemoteTerminalSpec()
+  var spec = g:SimpleRemoteTerminalSpec(command)
   botright new
   term_start(spec.command, {
     curwin: true,
@@ -3664,14 +4080,127 @@ def g:SimpleRemoteRecentWorkspaces(limit: number = -1): list<dict<any>>
   return result
 enddef
 
+# Configured profiles in the same shape as recent workspaces, for dashboards
+# and pickers.  A profile may omit its root; opening it then prompts.
+def g:SimpleRemoteProfiles(): list<dict<any>>
+  var result: list<dict<any>> = []
+  for spec in ConfiguredProfiles()
+    add(result, {
+      name: get(spec, 'name', ''),
+      kind: spec.kind,
+      target: spec.target,
+      root: get(spec, 'root', ''),
+      local_root: get(spec, 'local_root', ''),
+      source: 'profile',
+    })
+  endfor
+  return result
+enddef
+
 def g:SimpleRemoteOpenWorkspace(workspace: dict<any>)
   var spec = NormalizeSpec(workspace)
-  if empty(spec) || get(spec, 'root', '') !~# '^/'
+  var root = get(spec, 'root', '')
+  if empty(spec) || (root !~# '^/' && !(empty(root)
+        && get(spec, 'source', '') ==# 'profile'))
     Error('[SimpleRemote] invalid recent workspace')
     return
   endif
   spec.open_tree = true
   ConnectSpec(spec)
+enddef
+
+# The argv prefix that runs a program in the workspace root, for callers that
+# hand the runtime a real argv (every element quoted for the remote shell)
+# rather than a shell script: append the program and its arguments.  Empty
+# when no argv-safe transport exists, which is the case for plain ssh without
+# the runtime (OpenSSH re-joins arguments through the login shell).
+def g:SimpleRemoteExecArgv(): list<string>
+  if !IsReady()
+    return []
+  endif
+  var daemon = DaemonPath()
+  if !empty(daemon)
+    return [daemon, 'exec', '--kind', s_remote.kind,
+      '--target', s_remote.target, '--root', s_remote.root, '--']
+  endif
+  if s_remote.kind ==# 'docker'
+    return ['docker', 'exec', '-i', '-w', s_remote.root, s_remote.target]
+  endif
+  return []
+enddef
+
+# Lines a session file needs to bring this workspace back.  SimpleStartify
+# appends them to its session files (g:simplestartify_session_line_providers);
+# on load the global is picked up by the SimpleStartifySessionLoadPost hook
+# below, which reconnects and re-reads every remote:// buffer the session
+# restored as an empty shell.
+def g:SimpleRemoteSessionLines(): list<string>
+  if !IsReady()
+    return []
+  endif
+  var spec = {
+    name: get(s_remote.options, 'name', ''),
+    kind: s_remote.kind,
+    target: s_remote.target,
+    root: s_remote.root,
+    local_root: get(s_remote.options, 'local_root', ''),
+  }
+  return ['let g:simpleremote_session_workspace = ' .. string(spec)]
+enddef
+
+def ReloadRemoteBuffersAfterConnect()
+  for info in getbufinfo({bufloaded: 1})
+    if info.name !~# '^remote://' || get(info, 'changed', 0)
+      continue
+    endif
+    var path = substitute(info.name, '^remote://', '', '')
+    if !UnderRoot(path, s_remote.root)
+      continue
+    endif
+    var winid = bufwinid(info.bufnr)
+    if winid > 0
+      win_execute(winid, 'silent! edit')
+    else
+      # Unloaded, the buffer goes through its BufReadCmd (ReadRemote) again
+      # the next time a window shows it.
+      execute 'silent! bunload ' .. info.bufnr
+    endif
+  endfor
+enddef
+
+def g:SimpleRemoteRestoreSessionWorkspace()
+  var spec = get(g:, 'simpleremote_session_workspace', {})
+  unlet! g:simpleremote_session_workspace
+  if type(spec) != v:t_dict || empty(spec)
+    return
+  endif
+  var normalized = NormalizeSpec(spec)
+  if empty(normalized) || get(normalized, 'root', '') !~# '^/'
+    return
+  endif
+  if IsReady() && s_remote.kind ==# normalized.kind
+        && s_remote.target ==# normalized.target
+        && s_remote.root ==# normalized.root
+    ReloadRemoteBuffersAfterConnect()
+    return
+  endif
+  augroup SimpleRemoteSessionRestore
+    autocmd!
+    autocmd User SimpleRemoteConnected ++once call g:SimpleRemoteReloadSessionBuffers()
+  augroup END
+  normalized.open_tree = false
+  ConnectSpec(normalized)
+enddef
+
+def g:SimpleRemoteReloadSessionBuffers()
+  # Called from the Connected autocmd: `:edit` from inside an autocmd would not
+  # trigger the BufReadCmd that actually fetches the file, so leave the
+  # autocmd context first.
+  timer_start(0, (_) => {
+    if IsReady()
+      ReloadRemoteBuffersAfterConnect()
+    endif
+  })
 enddef
 
 def g:SimpleRemoteWorkspaceRoot(): string
@@ -3741,9 +4270,181 @@ def g:SimpleRemoteReadFile(path: string, Callback: func): number
     call(Callback, [false, 'remote path is outside the active workspace'])
     return -1
   endif
-  return Send('read', remote_path, (ok, body) => {
-    call(Callback, [ok, ok ? UnB64(body) : body])
+  return Send('read', {path: remote_path}, (ok, body) => {
+    call(Callback, [ok, body])
   })
+enddef
+
+# Run a shell command in the workspace root over the persistent agent
+# connection and deliver its combined output.  Callback is (ok, output).
+# Cheaper than job_start(g:SimpleRemoteShellCommand()) for short commands
+# because no new transport session is opened; use the latter for streaming
+# or long-running processes.
+def g:SimpleRemoteExecute(command: string, Callback: func): number
+  if !IsReady()
+    call(Callback, [false, 'remote workspace is not ready'])
+    return -1
+  endif
+  return Send('exec', {command: 'cd ' .. shellescape(s_remote.root)
+    .. ' && ' .. command}, Callback)
+enddef
+
+# Write a text file inside the active workspace atomically.  Callback is
+# (ok, path-or-error).
+def g:SimpleRemoteWriteFile(path: string, content: string,
+    Callback: func): number
+  if !IsReady()
+    call(Callback, [false, 'remote workspace is not ready'])
+    return -1
+  endif
+  var remote_path = NormalizeRemoteTarget(path)
+  if empty(remote_path) || !UnderRoot(remote_path, s_remote.root)
+    call(Callback, [false, 'remote path is outside the active workspace'])
+    return -1
+  endif
+  return Send('write', {path: remote_path, content: content}, (ok, body) => {
+    if ok
+      AnnounceFilesChanged([{path: remote_path, type: 'changed'}])
+    endif
+    call(Callback, [ok, body])
+  })
+enddef
+
+# A multi-line dict literal inside a lambda block does not compile (E723) and
+# takes the enclosing function down silently, so listing rows are built here.
+def ParseDirectoryListing(remote_path: string, body: string): list<dict<any>>
+  var entries: list<dict<any>> = []
+  for line in split(body, '\n')
+    var fields = split(line, "\t", 1)
+    if len(fields) < 2 || empty(fields[0])
+      continue
+    endif
+    add(entries, {
+      name: fields[0],
+      path: JoinRemotePath(remote_path, fields[0]),
+      type: fields[1],
+      size: len(fields) > 2 ? str2nr(fields[2]) : -1,
+      mtime: len(fields) > 3 ? str2nr(fields[3]) : -1,
+    })
+  endfor
+  return entries
+enddef
+
+# List a workspace directory.  Callback is (ok, entries-or-error) where each
+# entry is {name, path, type ('f'|'d'|'l'), size, mtime}; size/mtime are -1
+# with an agent too old for list-meta.
+def g:SimpleRemoteListDirectory(path: string, Callback: func): number
+  if !IsReady()
+    call(Callback, [false, 'remote workspace is not ready'])
+    return -1
+  endif
+  var remote_path = NormalizeRemoteTarget(path)
+  if empty(remote_path) || !UnderRoot(remote_path, s_remote.root)
+    call(Callback, [false, 'remote path is outside the active workspace'])
+    return -1
+  endif
+  return Send('list-meta', {path: remote_path}, (ok, body) => {
+    call(Callback, [ok, ok ? ParseDirectoryListing(remote_path, body) : body])
+  })
+enddef
+
+# Stream a remote file (or, with {recursive: true}, directory) into a local
+# path.  Options: force, recursive.  Callback is (ok, {remote, local, error}).
+def g:SimpleRemoteDownload(remote_path: string, local_path: string,
+    options: dict<any> = {}, Callback: func = null_function): bool
+  if !IsReady()
+    if Callback != null_function
+      call(Callback, [false, {error: 'remote workspace is not ready'}])
+    endif
+    return false
+  endif
+  var remote = NormalizeRemoteTarget(remote_path)
+  var local = substitute(fnamemodify(local_path, ':p'), '[\\/]\+$', '', '')
+  if empty(remote) || empty(local)
+    if Callback != null_function
+      call(Callback, [false, {error: 'remote and local paths are required'}])
+    endif
+    return false
+  endif
+  return StartTransfer('download', remote, local, options, Callback)
+enddef
+
+# Stream a local file (or, with {recursive: true}, directory) into a remote
+# path.  Options: force, recursive.  Callback is (ok, {remote, local, error}).
+def g:SimpleRemoteUpload(local_path: string, remote_path: string,
+    options: dict<any> = {}, Callback: func = null_function): bool
+  if !IsReady()
+    if Callback != null_function
+      call(Callback, [false, {error: 'remote workspace is not ready'}])
+    endif
+    return false
+  endif
+  var local = substitute(fnamemodify(local_path, ':p'), '[\\/]\+$', '', '')
+  var remote = NormalizeRemoteTarget(remote_path)
+  if empty(remote) || empty(local)
+    if Callback != null_function
+      call(Callback, [false, {error: 'remote and local paths are required'}])
+    endif
+    return false
+  endif
+  var settings = copy(options)
+  if !has_key(settings, 'recursive')
+    settings.recursive = isdirectory(local)
+  endif
+  return StartTransfer('upload', remote, local, settings, Callback)
+enddef
+
+def g:SimpleRemoteRuntimeCapabilities(): dict<any>
+  return copy(RuntimeCapabilities())
+enddef
+
+def g:SimpleRemoteTreeUpload()
+  UploadIntoRemoteTree()
+enddef
+
+def g:SimpleRemoteUploadCommand(local: string, remote_directory: string = '')
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  var source = substitute(fnamemodify(expand(local), ':p'), '[\\/]\+$', '', '')
+  var directory = empty(remote_directory)
+    ? (empty(s_tree) ? s_remote.root : get(s_tree, 'root', s_remote.root))
+    : remote_directory
+  UploadToRemote(source, directory)
+enddef
+
+def g:SimpleRemoteDownloadCommand(remote: string, local: string = '')
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  var remote_path = NormalizeRemoteTarget(remote)
+  var destination = local
+  if empty(destination)
+    var directory = LocalCopyDirectory()
+    destination = (empty(directory) ? getcwd() : directory)
+      .. '/' .. fnamemodify(remote_path, ':t')
+  endif
+  destination = substitute(fnamemodify(expand(destination), ':p'), '[\\/]\+$', '', '')
+  if isdirectory(destination)
+    destination ..= '/' .. fnamemodify(remote_path, ':t')
+  endif
+  var force = false
+  if filereadable(destination) || isdirectory(destination)
+    force = confirm("Replace local path?\n" .. destination, "&Replace\n&Cancel", 2) == 1
+    if !force
+      return
+    endif
+  endif
+  # Whether the remote path is a directory is only known remotely; ask the
+  # agent first so the transfer picks tar or cat accordingly.
+  Send('exec', {command: 'test -d ' .. shellescape(remote_path) .. ' && echo d || echo f'},
+    (ok, body) => {
+      var recursive = ok && trim(body) ==# 'd'
+      StartTransfer('download', remote_path, destination,
+        {force: force, recursive: recursive})
+    })
 enddef
 
 def g:SimpleRemoteStatusline(): string
@@ -3850,8 +4551,7 @@ def g:VimrcRemoteReloadConfig()
         endfor
       endif
       if applied
-        s_remote.simplecc_restart_pending = true
-        RestartSimpleCC(generation, buf)
+        AnnounceConfigChanged()
       endif
     endif
   })
@@ -3878,6 +4578,7 @@ def g:VimrcRemoteActivateBuffer()
     return
   endif
   DetectRemoteFiletype(bufnr())
+  SyncRemoteBufferName(bufnr())
   var writepost = get(b:, 'vimrc_remote_writepost_pending', {})
   b:vimrc_remote_writepost_pending = {}
   var info = get(b:, 'vimrc_remote', {})
@@ -3894,7 +4595,6 @@ def g:VimrcRemoteActivateBuffer()
       setlocal modified
     endif
   endif
-  MaybeStartSimpleCC(bufnr())
 enddef
 
 command! -nargs=+ VimrcRemoteConnect call g:VimrcRemoteConnect(<f-args>)
@@ -3918,6 +4618,8 @@ def g:VimrcConfigureRemote()
     autocmd BufEnter remote://* call g:VimrcRemoteActivateBuffer()
     autocmd BufEnter * call g:SimpleRemoteActivateLocalBuffer()
     autocmd VimLeavePre * call g:VimrcRemoteDisconnect()
+    autocmd User SimpleStartifySessionLoadPost call g:SimpleRemoteRestoreSessionWorkspace()
+    autocmd SessionLoadPost * call g:SimpleRemoteRestoreSessionWorkspace()
   augroup END
 enddef
 

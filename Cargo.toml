@@ -1,6 +1,6 @@
 [package]
 name = "simpleremote"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust transport runtime for the SimpleRemote Vim plugin"
@@ -9,6 +9,11 @@ repository = "https://github.com/beamiter/simpleremote"
 [[bin]]
 name = "simpleremote-daemon"
 path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 panic = "abort"

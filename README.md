@@ -11,23 +11,66 @@ Plug 'beamiter/simpleremote', { 'do': './install.sh' }
 
 ## Rust runtime
 
-`simpleremote-daemon agent` supervises the persistent remote shell agent.
-For SSH targets it uses a private deterministic OpenSSH ControlPath and
-ControlPersist, so filesystem RPC, reconnects, and other simple* processes can
-reuse authentication and the underlying connection.
+`simpleremote-daemon agent --protocol json` supervises the persistent remote
+shell agent as a **JSON bridge**: Vim exchanges one JSON object per line and
+the runtime performs every base64 step of the agent's line protocol
+in-process. Before this, Vim spawned `base64` twice per request; a directory
+listing, a file read, a save or a SimpleFinder preview no longer costs a
+process. Payloads that are not valid UTF-8 travel base64-encoded so latin-1
+and binary files round-trip byte for byte. Without the runtime, Vim still
+drives ssh/docker and base64 itself; an older runtime is detected through
+`simpleremote-daemon capabilities` and used the way it always was.
 
-The runtime replaces itself with the SSH/Docker transport for agent and exec
-jobs, so stopping a Vim job also stops the corresponding remote search or
-language-tool process instead of leaving it behind a local relay.
+The **remote agent installs itself**. Every connection ships the bundled
+`bin/simpleremote-agent.sh` inside the launch command, compares it with the
+installed copy and atomically replaces the copy only when it differs — a fresh
+host or a plugin update never needs `:SimpleRemoteInstallAgent`.
+
+For SSH targets the runtime uses a private deterministic OpenSSH ControlPath
+and ControlPersist, so the agent, probes, transfers, language servers,
+searches and terminals share one authenticated connection.
 
 `simpleremote-daemon exec` is the shared stdio process boundary. SimpleCC uses
 it to run pyright, basedpyright, or another language server in the active
-remote workspace. The runtime prepends the project `.venv/bin` when present.
-If the binary is unavailable, SimpleRemote and SimpleCC retain their direct
-SSH/Docker fallback.
+remote workspace; SimpleFinder runs its searches through it; SimpleGit runs
+`git` through it. The runtime replaces itself with the transport for exec
+jobs, so stopping a Vim job stops the remote process too, and it prepends the
+project `.venv/bin`, `~/.local/bin` and friends. `exec --tty` allocates a
+terminal, which `:SimpleRemoteTerminal` and SimpleTerminal use so remote
+shells share the connection and the same PATH prelude.
+
+`simpleremote-daemon download` and `upload` stream a file — or, with
+`--recursive`, a directory through `tar` — across the boundary, staged beside
+the destination and activated by rename; uploads refuse an existing
+destination unless `--force`. Without the runtime, `scp`/`docker cp` do the
+same job.
 
 Set `g:simpleremote_use_daemon = 0` to disable the runtime, or set
 `g:simpleremote_daemon_path` to a custom build.
+
+## Integration API for simple\* plugins
+
+Everything a sibling needs is a global function or a `User` event, all
+feature-detected, none required. `:help simpleremote-suite` maps who uses
+what; the short list:
+
+- `g:SimpleRemoteShellCommand(script)` / `g:SimpleRemoteExecArgv()` — run a
+  shell script or an argv in the workspace root through the runtime.
+- `g:SimpleRemoteExecute(cmd, Cb)`, `g:SimpleRemoteReadFile(path, Cb)`,
+  `g:SimpleRemoteWriteFile(path, content, Cb)`,
+  `g:SimpleRemoteListDirectory(path, Cb)` — asynchronous remote filesystem
+  operations over the persistent connection.
+- `g:SimpleRemoteDownload(remote, local, opts, Cb)` /
+  `g:SimpleRemoteUpload(local, remote, opts, Cb)` — file or directory
+  transfers.
+- `g:SimpleRemoteTerminalSpec([cmd])`, `g:SimpleRemoteStatusline()`,
+  `g:SimpleRemoteRecentWorkspaces()`, `g:SimpleRemoteProfiles()`,
+  `g:SimpleRemoteOpenWorkspace(ws)`, `g:SimpleRemoteSessionLines()`.
+- Events: `SimpleRemoteConnecting/Connected/WorkspaceChanged/RuntimeReady/
+  Disconnected` for the connection, `SimpleRemoteBufferRead` for buffers,
+  `SimpleRemoteFilesChanged` for tree/upload/API mutations,
+  `SimpleRemoteConfigChanged` for a reloaded remote `simplecc.json`,
+  `SimpleRemoteFileCopied/FileUploaded` for transfers.
 
 See `:help simpleremote` for commands, profiles, workspace projection, and the
 integration API.
@@ -80,12 +123,14 @@ vocabulary. Filesystem actions execute on the remote target:
 - `m` toggles a persistent target-scoped bookmark, `'` lists bookmarks, and
   `]b` / `[b` cycle through visible bookmarks.
 
-`gd` retains the cross-boundary download workflow: it streams the selected
-remote file through the Rust runtime into `simpletree#ExternalDropDirectory()`
-(or prompts when no local tree exists). The write is staged beside the
-destination and atomically activated. `y` copies the file name, `Y` copies the
-absolute remote path, and `gy` copies remote text file contents subject to
-`g:simpleremote_clipboard_max_bytes` (1 MiB by default).
+`gd` is the cross-boundary download: it streams the selected remote file — or
+directory — through the Rust runtime into `simpletree#ExternalDropDirectory()`
+(or prompts when no local tree exists), staged beside the destination and
+atomically activated; SimpleTree then reveals the new file. `gu` is the
+upload in the other direction: SimpleTree's selected node (or a prompted
+local path) lands in the selected remote directory. `y` copies the file name,
+`Y` copies the absolute remote path, and `gy` copies remote text file
+contents subject to `g:simpleremote_clipboard_max_bytes` (1 MiB by default).
 
 All copied text and resulting local paths use `simpleclipboard#CopyText()` when
 available. Successful downloads emit `User SimpleRemoteFileCopied` with

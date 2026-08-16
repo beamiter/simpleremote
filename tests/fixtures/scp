@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Stand-in for scp: the "remote" side is this machine, so `host:path` is just
+# `path`.  Only the flags SimpleRemote's fallback transfer uses are accepted.
+set -Eeuo pipefail
+
+: "${SIMPLEREMOTE_TEST_TARGET:?}"
+
+recursive=0
+while [[ ${1:-} == -* ]]; do
+  case $1 in
+    -q) ;;
+    -r) recursive=1 ;;
+    *) printf 'unexpected scp flag: %s\n' "$1" >&2; exit 64 ;;
+  esac
+  shift
+done
+[[ $# -eq 2 ]] || { printf 'unexpected scp arguments:' >&2; printf ' <%s>' "$@" >&2; echo >&2; exit 64; }
+
+strip() {
+  case $1 in
+    "$SIMPLEREMOTE_TEST_TARGET":*) printf '%s' "${1#"$SIMPLEREMOTE_TEST_TARGET":}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+src=$(strip "$1")
+dst=$(strip "$2")
+if [[ $recursive -eq 1 ]]; then
+  exec cp -R -- "$src" "$dst"
+fi
+exec cp -- "$src" "$dst"
