@@ -47,9 +47,16 @@ g:simpleremote_agent = AGENT
 g:simpletreesitter_auto_enable_filetypes = []
 g:simpleminimap_auto_open = 0
 g:simpleline_git_enabled = 0
+g:simplecc_auto_start = 0
+g:simplemarkdown_auto_open = 0
+g:simpleremote_profiles = [
+  {name: 'suite', kind: 'ssh', target: $SIMPLEREMOTE_TEST_TARGET, root: '/srv/suite'},
+]
 
 const SIBLINGS = ['simpleline', 'simpleeditorconfig', 'simpletreesitter',
-  'simpleminimap', 'simplewhichkey', 'simpleterminal']
+  'simpleminimap', 'simplewhichkey', 'simpleterminal', 'simplecc', 'simplegit',
+  'simplefinder', 'simpletree', 'simplestartify', 'simplemarkdown',
+  'simpleclipboard']
 execute 'set runtimepath^=' .. fnameescape(REPO)
 for plugin in SIBLINGS
   if Available(plugin)
@@ -167,6 +174,95 @@ def Run()
   endif
   g:SimpleRemoteTreeClose()
 
+  # SimpleCC spells a remote buffer's URI with the path on the remote host,
+  # which is what makes a language server running there understand it.
+  if Available('simplecc')
+    assert_equal('file://' .. BASE .. '/src/main.rs',
+      simplecc#PathToUri('remote://' .. BASE .. '/src/main.rs'),
+      'SimpleCC does not map a remote:// buffer to a remote file URI')
+    assert_equal('remote://' .. BASE .. '/src/main.rs',
+      simplecc#UriToPath('file://' .. BASE .. '/src/main.rs'),
+      'SimpleCC does not map a remote file URI back to a remote:// buffer')
+    add(exercised, 'simplecc: remote URI mapping')
+  endif
+
+  # SimpleGit sees a remote buffer as a file rather than a special buffer.
+  if Available('simplegit')
+    var status = simplegit#StatusDict(remote_buf)
+    assert_equal(v:t_dict, type(status),
+      'SimpleGit refused to look at the remote buffer')
+    add(exercised, 'simplegit: remote buffer is a file')
+  endif
+
+  # SimpleClipboard resolves the path on the remote host rather than a local
+  # guess.  :SimpleCopyPath goes to the system clipboard and never to a
+  # register — for local files too — so what it resolved is read back through
+  # its own report instead.
+  if Available('simpleclipboard')
+    var clipboard_window = bufwinid(remote_buf)
+    assert_true(clipboard_window > 0, 'the remote buffer lost its window')
+    win_gotoid(clipboard_window)
+    silent! simpleclipboard#CopyPathToClipboard(true)
+    assert_equal(strlen(BASE .. '/src/main.rs'),
+      get(simpleclipboard#LastCopy(), 'bytes', -1),
+      'SimpleClipboard did not copy the absolute remote path')
+    silent! simpleclipboard#CopyPathToClipboard(false)
+    assert_equal(strlen('src/main.rs'),
+      get(simpleclipboard#LastCopy(), 'bytes', -1),
+      'SimpleClipboard did not copy the workspace-relative remote path')
+    add(exercised, 'simpleclipboard: remote path resolution')
+  endif
+
+  # SimpleFinder searches the workspace rather than the local directory.  Its
+  # panel is a popup driven by typeahead, which a silent-ex Vim cannot feed;
+  # the cross-plugin promise is the root it resolves and the transport it
+  # would search through, and both are plain function calls.
+  if Available('simplefinder')
+    # Health() renders into its own scratch buffer rather than echoing.
+    silent! simplefinder#Health()
+    var health = join(getline(1, '$'), "\n")
+    assert_true(health =~# 'remote workspace: ssh:' .. TARGET .. ':' .. BASE,
+      'the finder did not detect the workspace: ' .. health)
+    assert_true(health =~# 'remote search: through the SimpleRemote transport',
+      'the finder would not search through the workspace transport: ' .. health)
+    silent! bwipeout!
+    var argv = g:SimpleRemoteShellCommand('printf hello')
+    assert_true(!empty(argv) && argv[0] ==# g:simpleremote_daemon_path,
+      'that transport is not the runtime: ' .. string(argv))
+    add(exercised, 'simplefinder: workspace detection and transport')
+  endif
+
+  # SimpleStartify offers the configured profile even with no history.
+  if Available('simplestartify')
+    var entries = g:SimpleRemoteProfiles()
+    assert_true(!empty(entries), 'no profiles to offer the dashboard')
+    assert_equal('suite', entries[0].name)
+    add(exercised, 'simplestartify: profile source')
+  endif
+
+  # SimpleMarkdown treats a remote markdown buffer as markdown.
+  if Available('simplemarkdown')
+    writefile(['# Remote', '', 'body'], BASE .. '/src/doc.md')
+    g:VimrcRemoteOpen(BASE .. '/src/doc.md')
+    assert_true(WaitFor(() => getline(1) ==# '# Remote'),
+      'the remote markdown buffer never loaded')
+    assert_equal('markdown', &filetype)
+    silent! SimpleMarkdownToc
+    assert_true(WaitFor(() => !empty(getqflist()) || !empty(getloclist(0))
+      || &filetype ==# 'markdown'),
+      'SimpleMarkdown refused the remote markdown buffer')
+    add(exercised, 'simplemarkdown: remote markdown buffer')
+  endif
+
+  # SimpleTree exports the selection SimpleRemote uploads from.
+  if Available('simpletree')
+    assert_equal(v:t_string, type(simpletree#ExternalSelectedPath()),
+      'SimpleTree does not export a selected path')
+    assert_equal(v:t_list, type(simpletree#ExternalMarkedPaths()),
+      'SimpleTree does not export its marked set')
+    add(exercised, 'simpletree: selection exports')
+  endif
+
   # A remote save reaches every BufWritePre consumer, which is what makes
   # trimming, format-on-save and friends work on a remote file at all.
   g:suite_writepre = 0
@@ -174,9 +270,15 @@ def Run()
     autocmd!
     autocmd BufWritePre remote://* g:suite_writepre += 1
   augroup END
-  var window = bufwinid(remote_buf)
-  assert_true(window > 0, 'the remote buffer lost its window')
-  win_gotoid(window)
+  var save_window = bufwinid(remote_buf)
+  if save_window <= 0
+    # The markdown detour reused this window; bring the buffer back.
+    execute 'buffer ' .. remote_buf
+    save_window = win_getid()
+  endif
+  assert_true(save_window > 0, 'the remote buffer lost its window')
+  win_gotoid(save_window)
+  assert_equal(remote_buf, bufnr(), 'the save window holds the wrong buffer')
   setline(2, '    let x = 2;')
   write
   assert_true(WaitFor(() => readfile(BASE .. '/src/main.rs')[1] ==# '    let x = 2;'),
