@@ -13,6 +13,10 @@ vim9script
 # with `make suite-check` in a real ~/.vim/plugged where the siblings live;
 # every sibling it cannot find is skipped and reported, so it stays useful as
 # the suite grows.
+#
+# What it asserts is therefore whatever is installed at the moment it runs: a
+# sibling being edited or rebuilt in another window can fail it, and that is
+# the test doing its job rather than a flake to retry away.
 
 set nocompatible
 set nomore
