@@ -399,6 +399,18 @@ SimpleEditorConfig, SimpleTreesitter, SimpleMinimap, SimpleMarkdown
              treat remote:// buffers (buftype acwrite) like files and refresh
              on SimpleRemoteBufferRead; SimpleEditorConfig walks
              .editorconfig files with g:SimpleRemoteReadFile().
+SimpleMotion, SimpleComment and the other buffer-content plugins need nothing
+             beyond not refusing a non-empty 'buftype'.
+
+One consequence of reading buffers asynchronously is worth knowing when
+writing a consumer: a buffer displayed in another window has its filetype
+detected there, through win_execute(), so FileType can fire for a buffer that
+is not the one under the cursor — and inside win_execute() bufnr('%') names
+that buffer, not the user's.  A plugin that must know where the cursor is
+should track it from BufEnter or CursorMoved, neither of which fires inside
+win_execute().  This is not particular to SimpleRemote (:bufdo and any other
+plugin's win_execute() do the same), but a remote workspace is where it
+happens routinely.
 SimpleWhichKey
              names the tree's multi-key mappings through
              simplewhichkey#Describe(..., 'n', true).
