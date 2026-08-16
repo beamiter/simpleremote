@@ -375,11 +375,18 @@ def OnRuntimeProbeError(generation: number, _channel: any, line: string)
   endif
 enddef
 
-def OnRuntimeProbeExit(generation: number, _job: any, status: number)
+# Vim may run exit_cb before the last of a job's output has been read, so the
+# probe is only assembled once the job has exited AND its channel has closed.
+# Finalising on exit alone loses the whole reply on a fast machine — which is
+# what a green local run and a red CI run disagreed about.
+def FinalizeRuntimeProbe(generation: number)
   if !IsCurrent(generation)
     return
   endif
-  var probe: dict<any> = {status: status}
+  if !get(s_remote, 'probe_exited', false) || !get(s_remote, 'probe_closed', false)
+    return
+  endif
+  var probe: dict<any> = {status: get(s_remote, 'probe_status', -1)}
   for line in get(s_remote, 'runtime_probe_lines', [])
     var separator = stridx(line, '=')
     if separator > 0
@@ -400,6 +407,23 @@ def OnRuntimeProbeExit(generation: number, _job: any, status: number)
   Emit('SimpleRemoteRuntimeReady', copy(g:simpleremote_workspace))
 enddef
 
+def OnRuntimeProbeExit(generation: number, _job: any, status: number)
+  if !IsCurrent(generation)
+    return
+  endif
+  s_remote.probe_exited = true
+  s_remote.probe_status = status
+  FinalizeRuntimeProbe(generation)
+enddef
+
+def OnRuntimeProbeClosed(generation: number, _channel: any)
+  if !IsCurrent(generation)
+    return
+  endif
+  s_remote.probe_closed = true
+  FinalizeRuntimeProbe(generation)
+enddef
+
 def StartRuntimeProbe(generation: number)
   var daemon = DaemonPath()
   if empty(daemon) || !IsCurrent(generation)
@@ -408,6 +432,9 @@ def StartRuntimeProbe(generation: number)
   s_remote.runtime_probe_lines = []
   s_remote.runtime_probe_error = ''
   s_remote.runtime_probe = {status: -1}
+  s_remote.probe_exited = false
+  s_remote.probe_closed = false
+  s_remote.probe_status = -1
   s_remote.probe_job = job_start([
     daemon, 'probe', '--kind', s_remote.kind, '--target', s_remote.target,
     '--root', s_remote.root,
@@ -415,6 +442,7 @@ def StartRuntimeProbe(generation: number)
     in_io: 'null', out_io: 'pipe', err_io: 'pipe', out_mode: 'nl', err_mode: 'nl',
     out_cb: (channel, line) => OnRuntimeProbeLine(generation, channel, line),
     err_cb: (channel, line) => OnRuntimeProbeError(generation, channel, line),
+    close_cb: (channel) => OnRuntimeProbeClosed(generation, channel),
     exit_cb: (job, status) => OnRuntimeProbeExit(generation, job, status),
   })
 enddef
