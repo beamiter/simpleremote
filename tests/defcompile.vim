@@ -1,10 +1,37 @@
 vim9script
 
+# Force-compile every :def in autoload/, then check the global surface the
+# rest of the configuration binds to.
+#
+# Vim9 compiles def bodies lazily, so a type error in a branch no test reaches
+# stays invisible until a user gets there.  The obvious spelling of the check
+# does not perform it:
+#
+#     source autoload/simpleremote.vim
+#     defcompile
+#
+# :defcompile compiles the functions of the script it is *executed in*, which
+# is this file — the sourced script's 253 defs belong to another script context
+# and were never touched.  Verified: a `var x: number = 'a string'` planted in
+# g:VimrcRemoteHealth() passed this gate with exit 0.  What did fail, when the
+# error happened to sit in a function reached while sourcing, was the assert
+# block below — so the gate looked alive while covering only the hot path.
+#
+# Sourcing a copy with a trailing :defcompile puts the compile inside the
+# script that owns the functions.  The copy is sourced instead of the original
+# rather than as well as it: these are `def g:Name()` globals, and defining
+# them twice is an error.
 set nomore
 g:simpleremote_use_daemon = 0
 var root = fnamemodify(expand('<sfile>:p'), ':h:h')
-execute 'source ' .. fnameescape(root .. '/autoload/simpleremote.vim')
-defcompile
+var source = root .. '/autoload/simpleremote.vim'
+var compiled = tempname() .. '.vim'
+writefile(readfile(source) + ['defcompile'], compiled)
+try
+  execute 'source ' .. fnameescape(compiled)
+finally
+  delete(compiled)
+endtry
 
 assert_equal(1, exists('*g:SimpleRemoteConnect'))
 assert_equal(1, exists('*g:SimpleRemoteShellCommand'))

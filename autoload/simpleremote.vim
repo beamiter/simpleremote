@@ -2165,7 +2165,10 @@ def RemoteTreeCollapseAll()
   if empty(s_tree)
     return
   endif
-  s_tree.expanded = {s_tree.root: true}
+  # Brackets because the key is computed: Vim9 reads {s_tree.root: true} as the
+  # literal key `s_tree` followed by `.root`, and refuses the whole function
+  # with E720 — which is why `z` in the tree has never collapsed anything.
+  s_tree.expanded = {[s_tree.root]: true}
   s_tree.reveal = s_tree.root
   RenderRemoteTree(s_tree.buf)
   echomsg '[SimpleRemote] collapsed all directories'
