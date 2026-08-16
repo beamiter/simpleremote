@@ -128,4 +128,10 @@ nnoremap <silent> <Plug>(simpleremote-status) <Cmd>SimpleRemoteStatus<CR>
 augroup SimpleRemoteTreeIntegration
   autocmd!
   autocmd User SimpleTreeRootChanged call g:SimpleRemoteOnSimpleTreeRootChanged()
+  # SimpleTree asks a provider to reveal buffers with a foreign scheme.
+  autocmd User SimpleTreeRevealForeign call g:SimpleRemoteTreeReveal()
+  # `gu` in a SimpleTree buffer uploads its selected node into the remote
+  # workspace; SimpleTree leaves the key free and keeps buffer maps set on
+  # FileType.
+  autocmd FileType simpletree nnoremap <buffer> <nowait> <silent> gu <Cmd>call g:SimpleRemoteUploadFromTree()<CR>
 augroup END

@@ -753,7 +753,11 @@ enddef
 
 def ReadRemote(uri: string)
   if empty(s_remote)
-    Error('[VimrcRemote] not connected')
+    # A session file re-edits remote:// buffers before the workspace exists;
+    # the session restore reconnects and re-reads them, so stay quiet then.
+    if !exists('g:SessionLoad')
+      Error('[VimrcRemote] not connected')
+    endif
     return
   endif
   var buf = bufnr()
@@ -1948,6 +1952,16 @@ def SetSimpleTreeRoot(path: string): bool
   if exists('*simpletree#ExternalSetRoot') != 1
     return false
   endif
+  # On an SSHFS mount inotify never reports remote-side changes and git
+  # status walks the network; newer SimpleTree accepts per-root options that
+  # switch both off so its idle mtime polling takes over.
+  if get(s_remote, 'workspace_mode', '') ==# 'sshfs'
+    try
+      return simpletree#ExternalSetRoot(path, 'simpleremote',
+        {watch: false, git: false})
+    catch
+    endtry
+  endif
   try
     # New SimpleTree versions publish this source in RootChanged, allowing the
     # listener below to distinguish our projection echo from a user re-root.
@@ -2528,11 +2542,13 @@ def SyncRemoteBufferName(buf: number)
   else
     return
   endif
-  var stale = bufnr('^' .. old_name .. '$')
-  if stale > 0 && stale != buf && !buflisted(stale)
-        && !getbufvar(stale, '&modified')
-    execute 'silent! bwipeout ' .. stale
-  endif
+  # Exact-name lookup: bufnr() would treat the old name as a file pattern.
+  for other in getbufinfo()
+    if other.bufnr != buf && other.name ==# old_name && !other.listed
+          && !get(other, 'changed', 0)
+      execute 'silent! bwipeout ' .. other.bufnr
+    endif
+  endfor
 enddef
 
 def RetargetRemoteBuffers(source: string, target: string)
@@ -4400,6 +4416,37 @@ enddef
 
 def g:SimpleRemoteTreeUpload()
   UploadIntoRemoteTree()
+enddef
+
+# `gu` inside a SimpleTree buffer: push the selected local node into the
+# remote workspace.  The destination defaults to the remote tree's selected
+# directory when that tree is open, else the workspace root.
+def g:SimpleRemoteUploadFromTree()
+  if !IsReady()
+    Error('[SimpleRemote] not connected')
+    return
+  endif
+  var local = LocalUploadSource()
+  if empty(local)
+    return
+  endif
+  var default = s_remote.root
+  var tree_buf = get(s_tree, 'buf', -1)
+  if tree_buf > 0 && bufwinid(tree_buf) > 0
+    var nodes = getbufvar(tree_buf, 'simpleremote_tree_nodes', [])
+    var index = getcurpos(bufwinid(tree_buf))[1] - 1
+    var node = index >= 0 && index < len(nodes) ? get(nodes, index, {}) : {}
+    if !empty(node)
+      default = get(node, 'type', '') ==# 'd' ? node.path : RemoteParent(node.path)
+    else
+      default = get(s_tree, 'root', s_remote.root)
+    endif
+  endif
+  var directory = input('Upload to remote directory: ', default)
+  if empty(directory)
+    return
+  endif
+  UploadToRemote(local, directory)
 enddef
 
 def g:SimpleRemoteUploadCommand(local: string, remote_directory: string = '')
