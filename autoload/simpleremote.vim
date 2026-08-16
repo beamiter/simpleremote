@@ -252,7 +252,7 @@ def OnExit(generation: number, _job: any, status: number)
   FailPending(remote, printf('connection closed (%d)', status))
   var detail = empty(remote.stderr) ? '' : ': ' .. remote.stderr[-1]
   echomsg printf('[VimrcRemote] connection closed (%d)%s', status, detail)
-  Emit('SimpleRemoteDisconnected', {reason: 'transport-exit', code: status})
+  Emit('SimpleRemoteDisconnected', {reason: 'disconnect', cause: 'transport-exit', code: status})
 enddef
 
 def AgentPath(): string
@@ -345,7 +345,8 @@ def AgentBootstrapScript(agent: string): string
   if index(lines, AGENT_HEREDOC) >= 0
     return 'exec ' .. destination
   endif
-  return 'dst=' .. destination .. '; dir=$(dirname -- "$dst"); umask 077; '
+  return 'dst=' .. destination
+    .. '; dir=$(dirname -- "$dst"); um=$(umask); umask 077; '
     .. 'mkdir -p -- "$dir" 2>/dev/null; '
     .. 'tmp=$(mktemp "$dir/.simpleremote-agent.XXXXXX" 2>/dev/null) || tmp=; '
     .. 'if [ -n "$tmp" ]; then '
@@ -354,6 +355,9 @@ def AgentBootstrapScript(agent: string): string
     .. 'if [ -x "$dst" ] && cmp -s -- "$tmp" "$dst"; then rm -f -- "$tmp"; '
     .. 'elif chmod 700 -- "$tmp" && mv -f -- "$tmp" "$dst"; then :; '
     .. 'else rm -f -- "$tmp"; fi; fi; '
+    # The agent, and every command it runs, must see the login umask — not
+    # the private one this installer needed.
+    .. 'umask "$um"; '
     .. 'if [ -x "$dst" ]; then exec "$dst"; fi; '
     .. 'printf ' .. "'simpleremote: cannot install agent at %s\\n'"
     .. ' "$dst" >&2; exit 126'
@@ -2817,7 +2821,8 @@ def RemoteTreeDelete()
     endif
   endfor
   var label = len(nodes) == 1 ? nodes[0].path : printf('%d marked nodes', len(nodes))
-  if confirm('Delete remote ' .. label .. '?', "&Delete\n&Cancel", 2) != 1
+  if get(g:, 'simpleremote_confirm_delete', 1)
+        && confirm('Delete remote ' .. label .. '?', "&Delete\n&Cancel", 2) != 1
     return
   endif
   var commands = ['set -e']
@@ -3171,10 +3176,17 @@ def StartTransfer(direction: string, remote: string, local: string,
     endif
     return false
   endif
-  if direction ==# 'upload' && !get(options, 'force', false)
-        && !RuntimeHandlesTransfer(direction, options)
+  if direction ==# 'download' && !get(options, 'force', false)
+        && !RuntimeHandlesTransfer(direction, options) && getftype(local) !=# ''
     # scp and docker cp overwrite silently; the runtime refuses an existing
     # destination unless forced, and the fallback must keep that promise.
+    FinishTransfer(direction, remote, local,
+      ['local destination already exists: ' .. local], Callback, 47)
+    return true
+  endif
+  if direction ==# 'upload' && !get(options, 'force', false)
+        && !RuntimeHandlesTransfer(direction, options)
+    # The same promise in the other direction, checked remotely.
     var probe = 'if [ -e ' .. shellescape(remote) .. ' ] || [ -L '
       .. shellescape(remote) .. ' ]; then echo exists; fi'
     var settings = extend(copy(options), {force: true})

@@ -259,6 +259,15 @@ impl Reply {
     }
 
     fn from_bytes(id: u64, ok: bool, bytes: Vec<u8>) -> Self {
+        // Vim's json_decode() drops U+0000, so a NUL-bearing payload is the
+        // one byte class valid UTF-8 would still lose: send it encoded.
+        if bytes.contains(&0) {
+            return Reply {
+                id,
+                ok,
+                data: Data::Base64(BASE64.encode(bytes)),
+            };
+        }
         let data = match String::from_utf8(bytes) {
             Ok(text) => Data::Text(text),
             Err(error) => Data::Base64(BASE64.encode(error.into_bytes())),
@@ -375,6 +384,22 @@ mod tests {
             r#"{"data":"not a file: /x","id":3,"ok":false}"#
         );
         assert!(ops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nul_bearing_payloads_travel_as_base64() {
+        // Valid UTF-8, but json_decode() would silently truncate it.
+        let ops = table(&[(11, "exec")]);
+        let bytes = b"a\0b";
+        let line = format!("11\tok\t{}", BASE64.encode(bytes));
+        let reply = parse_reply(&ops, line.as_bytes()).unwrap();
+        assert_eq!(
+            reply.to_json(),
+            format!(
+                r#"{{"data_b64":"{}","id":11,"ok":true}}"#,
+                BASE64.encode(bytes)
+            )
+        );
     }
 
     #[test]

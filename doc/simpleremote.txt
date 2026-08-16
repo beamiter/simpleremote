@@ -64,6 +64,8 @@ functions cannot be made transparent in virtual mode.
                               normally needed: every connection installs or
                               updates the agent itself.
 :SimpleRemoteHealth           Check remote host tools and working directory.
+:SimpleRemoteReloadConfig     Re-read the remote simplecc.json and announce it
+                              (see SimpleRemoteConfigChanged below).
 :SimpleRemoteStatus           Show transport, root, and projection mode.
 
 The older :VimrcRemote* commands and g:vimrc_remote_* variables remain as a
@@ -100,6 +102,7 @@ Options:
   g:simpleremote_tree_sort            name, extension, mtime, or size
   g:simpleremote_tree_sort_reverse    reverse each file/directory sort group
   g:simpleremote_tree_root_locked     protect the current tree/workspace root
+  g:simpleremote_confirm_delete       0 to delete tree nodes without asking
   g:simpleremote_tree_mark_symbol     marked-node display symbol
   g:simpleremote_tree_bookmark_symbol bookmarked-node display symbol
   g:simpleremote_tree_bookmarks_file  local persistent bookmark JSON path
@@ -143,20 +146,38 @@ Events expose their payload in g:simpleremote_event.  Every payload carries
                                      workspace} after a remote:// buffer was
                                      (re)filled and its filetype detected
   User SimpleRemoteFilesChanged      {changes: [{path, type}], workspace}
-                                     for created/changed/deleted paths made
-                                     by the tree, uploads and API writes —
-                                     not by buffer writes, which fire
-                                     BufWritePre/BufWritePost like local
-                                     files
+                                     for paths made by the tree, uploads and
+                                     API writes — not by buffer writes, which
+                                     fire BufWritePre/BufWritePost like local
+                                     files.  `type` is 'created', 'changed'
+                                     or 'deleted' as the operation intends it:
+                                     an upload always reports 'created' and
+                                     SimpleRemoteWriteFile() always reports
+                                     'changed', neither probes the remote
+                                     first, so a listener that cares about the
+                                     difference must check for itself
   User SimpleRemoteConfigChanged     {config} when the remote simplecc.json
-                                     was reloaded on a live connection
+                                     was reloaded on a live connection by
+                                     :SimpleRemoteReloadConfig.  It is only
+                                     emitted when something listens for it;
+                                     with no listener, :SimpleCCRestart is run
+                                     instead when that command exists
   User SimpleRemoteFileCopied        {remote, local} after a download
   User SimpleRemoteFileUploaded      {remote, local} after an upload
   User SimpleRemoteDisconnected      {reason}: 'disconnect' for a user or
                                      transport disconnect, 'reconnect' when
                                      the connection is being replaced (a
                                      workspace switch fires Disconnected,
-                                     Connecting, Connected in that order)
+                                     Connecting, Connected in that order).
+                                     A transport that died on its own adds
+                                     cause: 'transport-exit' and its exit
+                                     `code`
+
+g:simpleremote_workspace is unlet before Disconnected fires, so a listener
+that needs to know which workspace went away must have remembered it.
+WorkspaceChanged can arrive BEFORE Connected: a projection discovered during
+the handshake (local-map, docker-bind, an already-mounted sshfs) is activated
+inside it.  The Connected snapshot is always authoritative.
 
 The workspace snapshot, also kept in g:simpleremote_workspace while a
 connection is ready:
@@ -172,9 +193,13 @@ connection is ready:
                 the runtime's version and the transport protocol:
                 'json' (runtime bridge), 'exec' (older runtime) or
                 'legacy' (no runtime)
-  probe         {host, root, git, python, python_version, node,
+  probe         {protocol, host, root, git, python, python_version, node,
                 python_lsp, rg, tar, uname, runtime_ms, runtime_version,
-                status} from the runtime probe; {} until it ran
+                status} from the runtime probe, plus `error` when it wrote to
+                stderr.  {} without a runtime, and {status: -1} while the
+                probe is still in flight — test for a key you need (for
+                example has_key(probe, 'runtime_ms')) rather than for
+                emptiness
   uri           'remote://' .. root
 
 =============================================================================
@@ -225,16 +250,21 @@ persistent agent connection and calls Callback(ok, output) with the combined
 output; SimpleRemoteWriteFile() writes a text file atomically and calls
 Callback(ok, path-or-error); SimpleRemoteListDirectory() lists a directory
 and calls Callback(ok, entries) with {name, path, type, size, mtime}
-dictionaries (type is 'f', 'd' or 'l').  All three refuse paths outside the
-workspace and reply synchronously with ok = false when no workspace is
-ready.
+dictionaries (type is 'f', 'd' or 'l').  ReadFile, WriteFile and
+ListDirectory refuse paths outside the workspace; Execute takes a shell
+command, not a path, and runs whatever it is given.  All of them reply
+synchronously with ok = false when no workspace is ready.
 
-SimpleRemoteDownload() and SimpleRemoteUpload() stream a file or, with
-{recursive: true}, a directory across the boundary; {force: true} replaces
-an existing destination.  Callback(ok, {remote, local, error}) runs when the
+SimpleRemoteDownload() and SimpleRemoteUpload() stream a file or a directory
+across the boundary.  Upload infers {recursive} from the local path; Download
+needs {recursive: true} for a remote directory, because only the remote side
+knows what the path is (the :SimpleRemoteDownload command probes it with
+`test -d` first).  {force: true} replaces an existing destination; without it
+either direction fails with 'already exists', through the runtime and through
+the scp/docker-cp fallback alike.  A download never replaces a local
+directory, forced or not.  Callback(ok, {remote, local, error}) runs when the
 transfer finishes and the matching SimpleRemoteFileCopied /
-SimpleRemoteFileUploaded event fires.  Uploads that would replace an existing
-remote path fail with 'already exists' unless forced.
+SimpleRemoteFileUploaded event fires.
 
 SimpleRemoteRuntimeCapabilities() returns the installed runtime's
 capabilities object ({} without a runtime): version, bridge_protocol,
@@ -331,10 +361,15 @@ SimpleFinder searches through g:SimpleRemoteShellCommand(), previews through
              g:SimpleRemoteTreeSetRoot() and follows the connection events
              (Connecting keeps its state through a workspace switch).
 SimpleTree   receives root changes through simpletree#ExternalSetRoot(path,
-             'simpleremote'), provides the download destination through
-             simpletree#ExternalDropDirectory() and the upload source
-             through simpletree#ExternalSelectedPath(); its own root changes
-             arrive as User SimpleTreeRootChanged.
+             'simpleremote'), with a third {watch, git} argument on an sshfs
+             projection ({watch: false, git: false}, because inotify never
+             reports remote changes over FUSE and git status would walk the
+             network) — the two- and one-argument forms are the fallback for
+             older SimpleTree.  It provides the download destination through
+             simpletree#ExternalDropDirectory() and the upload source through
+             simpletree#ExternalSelectedPath(), answers
+             User SimpleTreeRevealForeign for remote:// buffers, and its own
+             root changes arrive as User SimpleTreeRootChanged.
 SimpleGit    runs git in the workspace with g:SimpleRemoteExecArgv() and
              recognises remote:// buffers through b:vimrc_remote.
 SimpleTerminal
@@ -359,8 +394,6 @@ SimpleWhichKey
              names the tree's multi-key mappings through
              simplewhichkey#Describe(..., 'n', true).
 
-vim:tw=78:ts=8:noet:ft=help:norl:
-
 RUNTIME PROBE                                      *simpleremote-runtime-probe*
 
 After connection the Rust runtime performs a non-blocking environment probe.
@@ -371,8 +404,14 @@ show the latest latency.
 *:SimpleRemoteProbe*
         Refresh the Rust runtime environment and latency snapshot.
 
-Remote execution prepends project .venv, .conda, venv, and env directories,
-plus $HOME/.local/bin and $HOME/bin, without sourcing interactive shell files.
+Programs the runtime starts — g:SimpleRemoteShellCommand(),
+g:SimpleRemoteExecArgv(), g:SimpleRemoteTerminalSpec(), transfers and the
+probe — get project .venv, .conda, venv and env directories on PATH, plus
+$HOME/.local/bin and $HOME/bin, without sourcing interactive shell files.
+The agent's own operations (g:SimpleRemoteExecute(), :SimpleRemoteExec,
+:SimpleRemoteGit, :SimpleRemoteFind, :SimpleRemoteHealth and the tree's
+filesystem actions) run in the agent's environment and do not get that
+prelude.
 
 TREE COPY INTEGRATION                          *simpleremote-tree-copy*
 
@@ -450,3 +489,5 @@ run :SimpleRemoteInstallAgent after upgrading an older installation.
         simpletree#ExternalSetRoot() calls do not feed back into another
         reconnect.  Set g:simpleremote_sync_tree_root to 0 for the historical
         view-only behavior.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

@@ -53,6 +53,9 @@ pub struct RuntimeArgs {
     pub local: String,
     pub force: bool,
     pub recursive: bool,
+    /// Byte count of a single-file upload, so the remote half can refuse a
+    /// stream that was cut short instead of activating a truncated file.
+    pub size: u64,
     pub allow_outside_root: bool,
     pub tty: bool,
     pub command: Vec<String>,
@@ -349,7 +352,7 @@ pub fn agent_bootstrap_script(agent: &str, content: &str) -> Result<String, Stri
     }
     Ok(format!(
         concat!(
-            "dst={dst}; dir=$(dirname -- \"$dst\"); umask 077; ",
+            "dst={dst}; dir=$(dirname -- \"$dst\"); um=$(umask); umask 077; ",
             "mkdir -p -- \"$dir\" 2>/dev/null; ",
             "tmp=$(mktemp \"$dir/.simpleremote-agent.XXXXXX\" 2>/dev/null) || tmp=; ",
             "if [ -n \"$tmp\" ]; then ",
@@ -357,6 +360,9 @@ pub fn agent_bootstrap_script(agent: &str, content: &str) -> Result<String, Stri
             "if [ -x \"$dst\" ] && cmp -s -- \"$tmp\" \"$dst\"; then rm -f -- \"$tmp\"; ",
             "elif chmod 700 -- \"$tmp\" && mv -f -- \"$tmp\" \"$dst\"; then :; ",
             "else rm -f -- \"$tmp\"; fi; fi; ",
+            // The agent, and everything it runs, must see the login umask —
+            // not the private one this installer needed.
+            "umask \"$um\"; ",
             "if [ -x \"$dst\" ]; then exec \"$dst\"; fi; ",
             "printf 'simpleremote: cannot install agent at %s\\n' \"$dst\" >&2; exit 126"
         ),
@@ -524,6 +530,9 @@ mod tests {
         let content = "#!/bin/sh\necho 'it''s' \"$HOME\"\n";
         let script = agent_bootstrap_script("~/.cache/vimrc/agent.sh", content).unwrap();
         assert!(script.starts_with("dst=\"$HOME\"/'.cache/vimrc/agent.sh'; "));
+        // The install umask must not leak into the agent's own environment.
+        assert!(script.contains("um=$(umask); umask 077; "));
+        assert!(script.contains("umask \"$um\"; if [ -x \"$dst\" ]; then exec \"$dst\"; fi"));
         assert!(script.contains(&format!(
             "cat >\"$tmp\" <<'{AGENT_HEREDOC}'\n{content}{AGENT_HEREDOC}\n"
         )));

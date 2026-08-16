@@ -23,6 +23,7 @@ const STATUS_WORKSPACE: i32 = 44;
 const STATUS_PATH: i32 = 45;
 const STATUS_BOUNDARY: i32 = 46;
 const STATUS_EXISTS: i32 = 47;
+const STATUS_TRUNCATED: i32 = 48;
 
 // ---------------------------------------------------------------------------
 // Remote scripts
@@ -42,7 +43,7 @@ pub fn download_script(args: &RuntimeArgs) -> String {
     let remote = shell_quote(&args.remote);
     if args.recursive {
         return format!(
-            "{prelude}; base=$(pwd -P) || exit {ws}; dir=$(readlink -f -- {remote} 2>/dev/null) || {{ printf 'cannot resolve remote directory: %s\\n' {remote} >&2; exit {path}; }}; {guard}[ -d \"$dir\" ] || {{ printf 'not a directory: %s\\n' \"$dir\" >&2; exit {path}; }}; exec tar -cf - -C \"$(dirname -- \"$dir\")\" \"$(basename -- \"$dir\")\"",
+            "{prelude}; base=$(pwd -P) || exit {ws}; dir=$(readlink -f -- {remote} 2>/dev/null) || {{ printf 'cannot resolve remote directory: %s\\n' {remote} >&2; exit {path}; }}; {guard}[ -d \"$dir\" ] || {{ printf 'not a directory: %s\\n' \"$dir\" >&2; exit {path}; }}; exec tar -cf - -C \"$(dirname -- \"$dir\")\" -- \"$(basename -- \"$dir\")\"",
             prelude = workspace_prelude(&args.root),
             ws = STATUS_WORKSPACE,
             path = STATUS_PATH,
@@ -67,6 +68,7 @@ pub fn upload_script(args: &RuntimeArgs) -> String {
     let dest = shell_quote(&args.remote);
     let name = shell_quote(local_name(&args.local));
     let force = if args.force { "1" } else { "0" };
+    let size = args.size;
     let prelude = workspace_prelude(&args.root);
     let guard = boundary_guard(args.allow_outside_root, "rdir");
     let common = format!(
@@ -81,9 +83,15 @@ pub fn upload_script(args: &RuntimeArgs) -> String {
             path = STATUS_PATH,
         );
     }
+    // `cat` reports success on any EOF, so a stream cut short by a killed
+    // runtime or a dropped connection would otherwise be renamed over the
+    // destination as if it were complete.  The expected length travels with
+    // the script and is checked before the rename; `wc -c` and the arithmetic
+    // test are POSIX, so this works on dash, busybox and BSD sh alike.
     format!(
-        "{common}if [ -d \"$dest\" ]; then printf 'remote destination is a directory: %s\\n' \"$dest\" >&2; exit {path}; fi; tmp=$(mktemp \"$rdir/.simpleremote-upload.XXXXXX\") || exit {path}; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; if [ -f \"$dest\" ]; then cp -p -- \"$dest\" \"$tmp\" || exit {path}; fi; cat >\"$tmp\" || exit {path}; mv -f -- \"$tmp\" \"$dest\" || exit {path}; trap - EXIT; printf 'remote=%s\\n' \"$dest\"",
+        "{common}size={size}; if [ -d \"$dest\" ]; then printf 'remote destination is a directory: %s\\n' \"$dest\" >&2; exit {path}; fi; tmp=$(mktemp \"$rdir/.simpleremote-upload.XXXXXX\") || exit {path}; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; if [ -f \"$dest\" ]; then cp -p -- \"$dest\" \"$tmp\" || exit {path}; fi; cat >\"$tmp\" || exit {path}; got=$(wc -c <\"$tmp\") || exit {path}; [ \"$got\" -eq \"$size\" ] || {{ printf 'upload truncated: %s bytes of %s\\n' \"$got\" \"$size\" >&2; exit {truncated}; }}; mv -f -- \"$tmp\" \"$dest\" || exit {path}; trap - EXIT; printf 'remote=%s\\n' \"$dest\"",
         path = STATUS_PATH,
+        truncated = STATUS_TRUNCATED,
     )
 }
 
@@ -150,6 +158,7 @@ fn describe_failure(prefix: &str, code: Option<i32>, stderr: &[u8]) -> String {
         Some(STATUS_PATH) => "remote path check failed",
         Some(STATUS_BOUNDARY) => "remote path leaves the workspace",
         Some(STATUS_EXISTS) => "remote destination already exists",
+        Some(STATUS_TRUNCATED) => "the upload was cut short and was not activated",
         _ => "transport failed",
     };
     if detail.is_empty() {
@@ -162,9 +171,19 @@ fn describe_failure(prefix: &str, code: Option<i32>, stderr: &[u8]) -> String {
 pub fn download(args: &RuntimeArgs) -> Result<u8, String> {
     let destination = PathBuf::from(&args.local);
     let parent = destination_parent(&destination)?;
-    if destination.symlink_metadata().is_ok() && !args.force {
+    let existing = destination.symlink_metadata().ok();
+    if existing.is_some() && !args.force {
         return Err(format!(
             "local destination already exists: {} (pass --force to replace it)",
+            destination.display()
+        ));
+    }
+    // A single file must never replace a directory, with or without --force:
+    // the remote half refuses the mirror case, and sweeping away a local tree
+    // is not something a file transfer may do.
+    if !args.recursive && existing.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+        return Err(format!(
+            "local destination is a directory: {}",
             destination.display()
         ));
     }
@@ -221,7 +240,12 @@ pub fn download(args: &RuntimeArgs) -> Result<u8, String> {
         temporary.clone()
     };
     if args.force && destination.symlink_metadata().is_ok() {
-        remove_any(&destination);
+        if args.recursive {
+            remove_any(&destination);
+        } else {
+            // Guarded above: this can only be a file or a symlink.
+            let _ = fs::remove_file(&destination);
+        }
     }
     if let Err(error) = fs::rename(&staged, &destination) {
         remove_any(&temporary);
@@ -299,7 +323,11 @@ fn remove_any(path: &Path) {
 }
 
 pub fn upload(args: &RuntimeArgs) -> Result<u8, String> {
-    let source = PathBuf::from(&args.local);
+    // Resolve the source before anything else: `tar` archives a symlink as a
+    // symlink, so a link to a directory would arrive as a dangling link
+    // instead of the tree the caller meant to send.
+    let source = fs::canonicalize(&args.local)
+        .map_err(|error| format!("cannot resolve local source {}: {error}", args.local))?;
     let metadata = fs::metadata(&source)
         .map_err(|error| format!("cannot read local source {}: {error}", source.display()))?;
     if args.recursive && !metadata.is_dir() {
@@ -314,6 +342,13 @@ pub fn upload(args: &RuntimeArgs) -> Result<u8, String> {
             source.display()
         ));
     }
+    // The remote half checks the byte count before it activates the upload,
+    // and the archive name must match the resolved source, not the link.
+    let args = &RuntimeArgs {
+        local: source.to_string_lossy().into_owned(),
+        size: if args.recursive { 0 } else { metadata.len() },
+        ..args.clone()
+    };
 
     let mut command = transport_command(args, "upload")?;
     let mut child = command
@@ -343,6 +378,9 @@ pub fn upload(args: &RuntimeArgs) -> Result<u8, String> {
             .arg("-")
             .arg("-C")
             .arg(&parent)
+            // Without the terminator a directory named like an option (-x)
+            // would be parsed as one.
+            .arg("--")
             .arg(&name)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -352,6 +390,13 @@ pub fn upload(args: &RuntimeArgs) -> Result<u8, String> {
         let mut archive = tar.stdout.take().ok_or("local tar has no stdout")?;
         let copied = io::copy(&mut archive, &mut stdin);
         drop(stdin);
+        // A remote refusal closes the pipe early.  Release tar's stdout and
+        // kill it before waiting: still holding the read end would leave tar
+        // blocked in write() forever, and this process blocked on it.
+        drop(archive);
+        if copied.is_err() {
+            let _ = tar.kill();
+        }
         let tar_status = tar
             .wait()
             .map_err(|error| format!("cannot wait for tar: {error}"))?;
@@ -422,11 +467,9 @@ mod tests {
             ..args()
         });
         assert!(tree.contains("[ -d \"$dir\" ]"));
-        assert!(
-            tree.ends_with(
-                "exec tar -cf - -C \"$(dirname -- \"$dir\")\" \"$(basename -- \"$dir\")\""
-            )
-        );
+        assert!(tree.ends_with(
+            "exec tar -cf - -C \"$(dirname -- \"$dir\")\" -- \"$(basename -- \"$dir\")\""
+        ));
 
         let anywhere = download_script(&RuntimeArgs {
             allow_outside_root: true,

@@ -79,6 +79,9 @@ endif
 if !exists('g:simpleremote_copy_destination')
   g:simpleremote_copy_destination = ''
 endif
+if !exists('g:simpleremote_confirm_delete')
+  g:simpleremote_confirm_delete = 1
+endif
 if !exists('g:simpleremote_copy_prompt')
   g:simpleremote_copy_prompt = 0
 endif

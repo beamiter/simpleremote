@@ -12,6 +12,7 @@ const TARGET = $SIMPLEREMOTE_TEST_TARGET
 const BASE = tempname()
 const AGENT_DIR = BASE .. '-agents'
 mkdir(BASE .. '/src', 'p')
+mkdir(BASE .. '/dest', 'p')
 writefile(['alpha  '], BASE .. '/src/alpha.txt')
 writefile(['beta'], BASE .. '/src/beta.txt')
 writefile(['{"workspace": "events"}'], BASE .. '/simplecc.json')
@@ -25,6 +26,9 @@ g:simpleremote_change_directory = 'none'
 g:simpleremote_agent = AGENT_DIR .. '/simpleremote-agent.sh'
 g:simpleremote_tree_use_nerdfont = 0
 g:simpleremote_tree_root_locked = 0
+# confirm() cannot be answered in silent-ex mode, so the destructive key is
+# driven with its confirmation turned off.
+g:simpleremote_confirm_delete = 0
 g:simpleremote_profiles = [
   {name: 'events', kind: 'ssh', target: TARGET, root: BASE},
   {name: 'rootless', kind: 'ssh', target: TARGET},
@@ -61,12 +65,27 @@ augroup IntegrationEventsTest
   autocmd User SimpleRemoteBufferRead Record('read')
   autocmd User SimpleRemoteFilesChanged Record('files')
   autocmd User SimpleRemoteConfigChanged Record('config')
+  autocmd User SimpleRemoteFileUploaded Record('uploaded')
+  autocmd User SimpleRemoteFileCopied Record('copied')
   autocmd BufWritePre remote://* g:writepre_seen += 1
 augroup END
 g:writepre_seen = 0
 
 def Named(name: string): list<dict<any>>
   return filter(copy(events), (_, event) => event.name ==# name)
+enddef
+
+# The remote command finishes before its reply reaches Vim, so a file can be
+# on disk while its SimpleRemoteFilesChanged event is still in flight: wait
+# for the event, never for the filesystem alone.
+def LastChanges(): list<any>
+  var seen = Named('files')
+  return empty(seen) ? [] : seen[-1].changes
+enddef
+
+def WaitForChanges(expected: list<any>, message: string)
+  assert_true(WaitFor(() => LastChanges() ==# expected),
+    message .. ': got ' .. string(LastChanges()))
 enddef
 
 def TreeWin(): number
@@ -162,11 +181,81 @@ def Run()
     'renamed buffer kept its old name')
   assert_equal(-1, bufnr('remote://' .. BASE .. '/src/alpha.txt'),
     'stale buffer with the old name survived')
-  var files = Named('files')
-  assert_true(!empty(files), 'SimpleRemoteFilesChanged did not fire')
-  var last = files[-1].changes
-  assert_equal([{path: BASE .. '/src/alpha.txt', type: 'deleted'},
-    {path: BASE .. '/src/renamed.txt', type: 'created'}], last)
+  WaitForChanges([{path: BASE .. '/src/alpha.txt', type: 'deleted'},
+    {path: BASE .. '/src/renamed.txt', type: 'created'}],
+    'rename announced the wrong changes')
+
+  # Every tree mutation announces itself, not only renames.
+  win_gotoid(TreeWin())
+  cursor(PathLine(BASE .. '/src'), 1)
+  feedkeys("made.txt\<CR>", 't')
+  g:SimpleRemoteTreeNewFile()
+  WaitForChanges([{path: BASE .. '/src/made.txt', type: 'created'}],
+    'tree create announced the wrong change')
+  assert_true(filereadable(BASE .. '/src/made.txt'))
+
+  win_gotoid(TreeWin())
+  assert_true(WaitFor(() => PathLine(BASE .. '/src/made.txt') > 0),
+    'tree did not settle after creating')
+  cursor(PathLine(BASE .. '/src/made.txt'), 1)
+  g:SimpleRemoteTreeCopy()
+  cursor(PathLine(BASE .. '/src'), 1)
+  # Pasting into the directory the file already sits in would collide, so the
+  # copy goes to the workspace root instead.
+  assert_true(g:SimpleRemoteTreeSetRoot(BASE))
+  assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}), 'root', '')
+    ==# BASE), 'tree root did not return to the workspace root')
+  win_gotoid(TreeWin())
+  assert_true(WaitFor(() => PathLine(BASE .. '/src') > 0), 'tree did not reload')
+  cursor(1, 1)
+  g:SimpleRemoteTreePaste()
+  WaitForChanges([{path: BASE .. '/made.txt', type: 'created'}],
+    'copy-paste announced the wrong change')
+  assert_true(filereadable(BASE .. '/made.txt'))
+
+  win_gotoid(TreeWin())
+  assert_true(WaitFor(() => PathLine(BASE .. '/made.txt') > 0),
+    'pasted file did not appear')
+  cursor(PathLine(BASE .. '/made.txt'), 1)
+  g:SimpleRemoteTreeCut()
+  cursor(PathLine(BASE .. '/dest'), 1)
+  g:SimpleRemoteTreePaste()
+  WaitForChanges([{path: BASE .. '/made.txt', type: 'deleted'},
+    {path: BASE .. '/dest/made.txt', type: 'created'}],
+    'cut-paste announced the wrong changes')
+  assert_false(filereadable(BASE .. '/made.txt'))
+  assert_true(filereadable(BASE .. '/dest/made.txt'))
+
+  win_gotoid(TreeWin())
+  assert_true(WaitFor(() => PathLine(BASE .. '/dest') > 0),
+    'tree did not settle after the move')
+  cursor(PathLine(BASE .. '/dest'), 1)
+  g:SimpleRemoteTreeActivate('edit')
+  assert_true(WaitFor(() => PathLine(BASE .. '/dest/made.txt') > 0),
+    'moved file did not appear')
+  win_gotoid(TreeWin())
+  cursor(PathLine(BASE .. '/dest/made.txt'), 1)
+  g:SimpleRemoteTreeDelete()
+  WaitForChanges([{path: BASE .. '/dest/made.txt', type: 'deleted'}],
+    'delete announced the wrong change')
+  assert_false(filereadable(BASE .. '/dest/made.txt'))
+
+  # The transfer commands, including the download command's directory probe.
+  var drop = BASE .. '/drop'
+  mkdir(drop, 'p')
+  writefile(['pushed'], drop .. '/pushed.txt')
+  g:SimpleRemoteUploadCommand(drop .. '/pushed.txt', BASE .. '/src')
+  assert_true(WaitFor(() => filereadable(BASE .. '/src/pushed.txt')),
+    ':SimpleRemoteUpload did not land the file')
+  assert_equal(['pushed'], readfile(BASE .. '/src/pushed.txt'))
+  assert_true(WaitFor(() => !empty(Named('uploaded'))),
+    'the upload command did not fire SimpleRemoteFileUploaded')
+  assert_equal(BASE .. '/src/pushed.txt', Named('uploaded')[-1].remote)
+  g:SimpleRemoteDownloadCommand(BASE .. '/src', drop .. '/srccopy')
+  assert_true(WaitFor(() => filereadable(drop .. '/srccopy/pushed.txt')),
+    ':SimpleRemoteDownload did not recurse into the remote directory')
+  assert_true(WaitFor(() => !empty(Named('copied'))),
+    'the download command did not fire SimpleRemoteFileCopied')
 
   # An API write announces a change too.
   var done = false
@@ -174,40 +263,69 @@ def Run()
     done = true
   })
   assert_true(WaitFor(() => done), 'api write did not finish')
-  assert_equal({path: BASE .. '/src/beta.txt', type: 'changed'},
-    Named('files')[-1].changes[0])
+  WaitForChanges([{path: BASE .. '/src/beta.txt', type: 'changed'}],
+    'the API write announced the wrong change')
 
   # Reloading the remote config announces it when someone listens.
   g:VimrcRemoteReloadConfig()
   assert_true(WaitFor(() => !empty(Named('config'))), 'ConfigChanged did not fire')
   assert_match('events', Named('config')[0].config)
 
-  # A workspace switch reports 'reconnect', not a user disconnect.
+  # A workspace switch reports 'reconnect', not a user disconnect, and it
+  # fires Disconnected, Connecting, Connected in that order.
+  events = []
   assert_true(g:SimpleRemoteTreeSetRoot(BASE .. '/src'))
   assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}), 'root', '')
     ==# BASE .. '/src'), 'workspace switch did not finish')
-  var disconnected = Named('disconnected')
-  assert_equal(1, len(disconnected))
-  assert_equal('reconnect', disconnected[0].reason)
+  assert_true(WaitFor(() => !empty(Named('connected'))),
+    'the switch never announced the new connection')
+  var order = mapnew(events, (_, event) => event.name)
+    ->filter((_, name) => index(['disconnected', 'connecting', 'connected'], name) >= 0)
+  assert_equal(['disconnected', 'connecting', 'connected'], order)
+  assert_equal('reconnect', Named('disconnected')[0].reason)
 
-  # Session lines bring the workspace back and re-read its buffers.
+  # Without a runtime there is no argv-safe transport, and the terminal spec
+  # falls back to plain ssh.
+  g:simpleremote_use_daemon = 0
+  assert_equal([], g:SimpleRemoteExecArgv())
+  assert_equal('ssh', g:SimpleRemoteTerminalSpec().command[0])
+  g:simpleremote_use_daemon = 1
+  assert_equal(g:simpleremote_daemon_path, g:SimpleRemoteTerminalSpec().command[0])
+
+  # Session lines bring the workspace back and re-read its buffers.  Open the
+  # file fresh first: the buffer from the start of this test belongs to a
+  # generation two re-roots ago.  Leave the tree window before doing it — it
+  # is nofile/bufhidden=wipe and must not host a file.
+  g:SimpleRemoteTreeClose()
+  botright new
+  assert_true(filereadable(BASE .. '/src/renamed.txt'),
+    'the renamed file vanished during the tree exercises')
+  g:VimrcRemoteOpen(BASE .. '/src/renamed.txt')
+  # The re-root queued a tree reopen; it can steal the cursor while we wait,
+  # so watch the buffer rather than whatever window happens to be current.
+  var reopened = bufnr()
+  assert_true(WaitFor(() => getbufline(reopened, 1) ==# ['alpha']),
+    'could not reopen the renamed file: ' .. bufname(reopened))
+  g:SimpleRemoteTreeClose()
+  var reopened_win = bufwinid(reopened)
+  assert_true(reopened_win > 0, 'the reopened buffer lost its window')
+  win_gotoid(reopened_win)
+
   var lines = g:SimpleRemoteSessionLines()
   assert_equal(1, len(lines))
   assert_match('^let g:simpleremote_session_workspace = ', lines[0])
   SimpleRemoteDisconnect
   assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
   assert_equal('disconnect', Named('disconnected')[-1].reason)
-  win_gotoid(bufwinid(bufnr('remote://' .. BASE .. '/src/renamed.txt')))
-  assert_equal(['alpha'], getline(1, '$'))
-  setline(1, 'stale shell')
-  setlocal nomodified
+  setbufline(reopened, 1, 'stale shell')
+  setbufvar(reopened, '&modified', 0)
   # Session files are legacy Vim script; run the line the way :source would.
   execute 'legacy ' .. lines[0]
   doautocmd <nomodeline> User SimpleStartifySessionLoadPost
   assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}), 'root', '')
     ==# BASE .. '/src' && get(g:, 'simpleremote_status', '') ==# 'ssh:' .. TARGET),
     'session restore did not reconnect')
-  assert_true(WaitFor(() => getline(1) ==# 'alpha'),
+  assert_true(WaitFor(() => getbufline(reopened, 1) ==# ['alpha']),
     'session restore did not re-read the remote buffer')
   assert_false(exists('g:simpleremote_session_workspace'))
 enddef
