@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simpleremote-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # The crate declares a minimum supported Rust version; a dependency bump or a
+  # newly used language feature can quietly break it, because every other job
+  # runs on stable.  The toolchain is derived from Cargo.toml rather than
+  # written out again here: stating the minimum twice is how a suite-wide bump
+  # leaves workflows behind, and a workflow pinned below `rust-version` does not
+  # fail a test — cargo refuses to build at all, before anything is checked.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: msrv
+        name: Read the declared minimum supported Rust
+        run: |
+          version="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml)"
+          test -n "$version" || { echo "Cargo.toml declares no rust-version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minimum supported Rust: $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Build on the declared minimum supported Rust
+        run: cargo check --all-targets --locked
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # vim-nox rather than the minimal build: the gate compiles every :def
+      # ahead of time and drives real channels, which the tiny build has not.
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim-nox
+          vim --version
+
+      # One target, not a hand-picked list of steps.  `make check` is the gate a
+      # developer runs before pushing, so it is the gate CI runs; a list here
+      # would drift from the Makefile and go quietly green.  The remote targets
+      # it drives use the stub agents under tests/fixtures, so nothing here
+      # needs an ssh server or a docker daemon.
+      - name: make check
+        run: make check
