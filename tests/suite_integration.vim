@@ -56,7 +56,7 @@ g:simpleremote_profiles = [
 const SIBLINGS = ['simpleline', 'simpleeditorconfig', 'simpletreesitter',
   'simpleminimap', 'simplewhichkey', 'simpleterminal', 'simplecc', 'simplegit',
   'simplefinder', 'simpletree', 'simplestartify', 'simplemarkdown',
-  'simpleclipboard']
+  'simpleclipboard', 'simplemotion', 'simplecomment']
 execute 'set runtimepath^=' .. fnameescape(REPO)
 for plugin in SIBLINGS
   if Available(plugin)
@@ -83,6 +83,19 @@ def WaitFor(Condition: func(): bool, timeout: float = 8.0): bool
     sleep 10m
   endwhile
   return Condition()
+enddef
+
+# Sections here open other buffers — the markdown detour, the finder's health
+# report — so a window can come back holding something else.  Put the buffer
+# under test back in front before each one that needs it.
+def FocusBuffer(buf: number)
+  var window = bufwinid(buf)
+  if window > 0
+    win_gotoid(window)
+  else
+    execute 'buffer ' .. buf
+  endif
+  assert_equal(buf, bufnr(), 'could not focus the buffer under test')
 enddef
 
 def TreeWindow(): number
@@ -134,6 +147,32 @@ def Run()
       BASE .. '/.editorconfig') >= 0,
       'the applied config did not come from the remote workspace root')
     add(exercised, 'simpleeditorconfig: remote .editorconfig walk')
+  endif
+
+  # SimpleMotion puts its hints in a remote buffer; it used to skip every
+  # window whose 'buftype' was not empty, which is all of them here.
+  if Available('simplemotion')
+    FocusBuffer(remote_buf)
+    assert_true(!empty(simplemotion#FindTargets('ma', false)),
+      'SimpleMotion finds no targets inside a remote buffer')
+    add(exercised, 'simplemotion: hints in a remote buffer')
+  endif
+
+  # SimpleComment works on the remote buffer's text like any other.
+  if Available('simplecomment')
+    FocusBuffer(remote_buf)
+    var before = getline(3)
+    cursor(3, 1)
+    silent! execute "normal \<Plug>(simplecomment-toggle-line)"
+    assert_notequal(before, getline(3),
+      'SimpleComment did not touch the remote buffer')
+    silent! execute "normal \<Plug>(simplecomment-toggle-line)"
+    assert_equal(before, getline(3),
+      'SimpleComment did not restore the remote line')
+    # Commenting and uncommenting returns the text but leaves the buffer
+    # marked modified, which would block the :edit further down.
+    setlocal nomodified
+    add(exercised, 'simplecomment: remote buffer text')
   endif
 
   # The minimap treats the acwrite buffer as a source.
@@ -199,9 +238,7 @@ def Run()
   # register — for local files too — so what it resolved is read back through
   # its own report instead.
   if Available('simpleclipboard')
-    var clipboard_window = bufwinid(remote_buf)
-    assert_true(clipboard_window > 0, 'the remote buffer lost its window')
-    win_gotoid(clipboard_window)
+    FocusBuffer(remote_buf)
     silent! simpleclipboard#CopyPathToClipboard(true)
     assert_equal(strlen(BASE .. '/src/main.rs'),
       get(simpleclipboard#LastCopy(), 'bytes', -1),
@@ -270,15 +307,7 @@ def Run()
     autocmd!
     autocmd BufWritePre remote://* g:suite_writepre += 1
   augroup END
-  var save_window = bufwinid(remote_buf)
-  if save_window <= 0
-    # The markdown detour reused this window; bring the buffer back.
-    execute 'buffer ' .. remote_buf
-    save_window = win_getid()
-  endif
-  assert_true(save_window > 0, 'the remote buffer lost its window')
-  win_gotoid(save_window)
-  assert_equal(remote_buf, bufnr(), 'the save window holds the wrong buffer')
+  FocusBuffer(remote_buf)
   setline(2, '    let x = 2;')
   write
   assert_true(WaitFor(() => readfile(BASE .. '/src/main.rs')[1] ==# '    let x = 2;'),
