@@ -41,6 +41,7 @@ endtry
 assert_equal(1, exists('*g:SimpleRemoteConnect'))
 assert_equal(1, exists('*g:SimpleRemoteShellCommand'))
 assert_equal(1, exists('*g:SimpleRemoteProbe'))
+assert_equal(1, exists('*g:SimpleRemoteLoadBuffer'))
 assert_equal(1, exists('*g:SimpleRemoteTreeCopyOut'))
 assert_equal(1, exists('*g:SimpleRemoteTreeUpload'))
 assert_equal(1, exists('*g:SimpleRemoteUploadFromTree'))

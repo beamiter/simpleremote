@@ -47,6 +47,9 @@ functions cannot be made transparent in virtual mode.
                               and S/V/t open files in split/vsplit/tab.
 :SimpleRemoteTreeReveal       Reveal the current local or remote file.
 :SimpleRemoteOpen {path}      Open a remote path relative to the workspace.
+:SimpleRemoteLoad             Read the file a deferred remote buffer stands
+                              for (see |simpleremote-large-files|).  <CR> in
+                              such a buffer does the same.
 :SimpleRemoteExec {command}   Execute in the remote workspace root.
 :SimpleRemoteFind {query}     Find remote file names.
 :SimpleRemoteGit {args}       Run remote Git and populate quickfix.
@@ -116,9 +119,12 @@ Options:
   g:simpleremote_request_timeout      milliseconds a single agent request may
                                       take before it fails as "request timed
                                       out" (default 15000, 0 waits forever).
-                                      Raise it for large remote files: the
-                                      whole body travels as one reply, so a
-                                      slow link can outlast the default.
+                                      A read whose size is known scales its
+                                      own timeout up from this value.
+  g:simpleremote_large_file_bytes     size above which a remote file is not
+                                      read on sight (default 10485760, 0
+                                      opens everything immediately); see
+                                      |simpleremote-large-files|
 
 The key for g:simpleremote_local_roots is "kind:target:/remote/root".
 
@@ -136,6 +142,27 @@ editing, remote filesystem mutations, marks, bookmarks, sorting, filtering,
 Git badges, split/vsplit/tabedit, and workspace-root changes.  Buffer-content
 plugins work; local filesystem daemons require a projection or explicit
 SimpleRemote integration.
+
+LARGE FILES                                     *simpleremote-large-files*
+
+A remote read arrives as a single reply holding the whole file, so a large one
+costs the transport, the buffer and the request timeout at once -- and because
+the agent answers in order, every request queued behind it waits as well.  A
+workspace with a 150MB metrics CSV at the top of its listing made that
+concrete: opening the file ended in "request timed out: read", and so did the
+reads that followed it.
+
+Opening a file over g:simpleremote_large_file_bytes therefore transfers
+nothing.  The buffer holds a hint naming the file and its size, is not
+modifiable, and refuses :write so it can never be saved over the file it
+stands for.  <CR>, or :SimpleRemoteLoad, reads it into that same buffer; a
+confirmed read also gets a timeout scaled to the size, so a deliberate one is
+not cut off by g:simpleremote_request_timeout.
+
+The size is measured with one small request before the read, which is also
+what lets an ordinary read size its own timeout.  A size that cannot be
+measured is never a reason to hold a file back: the read runs and reports
+whatever is actually wrong with it.
 
 Events expose their payload in g:simpleremote_event.  Every payload carries
 "event" (the event name), "status" (g:simpleremote_status at the time) and

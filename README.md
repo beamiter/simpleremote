@@ -81,6 +81,17 @@ what; the short list:
 See `:help simpleremote` for commands, profiles, workspace projection, and the
 integration API.
 
+## Large files
+
+A remote read arrives as one reply holding the whole file, so a large one
+costs the transport, the buffer and the request timeout at once — and because
+the agent answers in order, everything queued behind it waits too. Opening a
+file over `g:simpleremote_large_file_bytes` (10 MiB by default) therefore
+transfers nothing: the buffer holds a hint naming the file and its size, is
+not modifiable, and refuses `:write`. `<CR>` or `:SimpleRemoteLoad` reads it
+into that same buffer, with a timeout scaled to the size so a deliberate load
+is not cut off. Set the option to 0 to open everything on sight.
+
 ## SimpleFinder integration
 
 SimpleFinder detects the active remote workspace automatically.  In a virtual

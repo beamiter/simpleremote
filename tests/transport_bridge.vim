@@ -18,6 +18,7 @@ writefile(0zC3A9FFFE0A, BASE .. '/latin.bin')
 writefile(['inner'], BASE .. '/dir/inner/deep.txt')
 writefile(['top'], BASE .. '/dir/top.txt')
 writefile(['local file'], BASE .. '/local/up.txt')
+writefile([repeat('L', 500)], BASE .. '/large.txt')
 mkdir(BASE .. '/local/tree/sub', 'p')
 writefile(['one'], BASE .. '/local/tree/one.txt')
 writefile(['two'], BASE .. '/local/tree/sub/two.txt')
@@ -229,6 +230,54 @@ def ReadTimeoutIsReported()
   assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
 enddef
 
+# A file past g:simpleremote_large_file_bytes is not read on sight: the buffer
+# holds a hint, nothing has crossed the transport, and the read happens only
+# once the user confirms it.
+def LargeFileWaitsForConfirmation()
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(Ready), 'deferred: workspace did not become ready')
+
+  g:simpleremote_large_file_bytes = 64
+  g:VimrcRemoteOpen(BASE .. '/large.txt')
+  assert_true(WaitFor(() => getline(1) =~# 'has not been read'),
+    'the oversized file was not deferred')
+  assert_match('501 B, over the 64 B', join(getline(1, '$'), "\n"),
+    'the hint does not say what it measured')
+  assert_true(empty(get(b:, 'vimrc_remote', {})),
+    'a deferred buffer must not claim to be backed by the file')
+  assert_false(&modifiable, 'a deferred buffer is not editable')
+  assert_equal('', &filetype, 'a deferred buffer must not detect a filetype')
+  assert_match('SimpleRemoteLoad', maparg('<CR>', 'n'),
+    'the hint does not offer its confirmation')
+
+  # Saving the hint over the file it stands for is the one mistake that would
+  # cost data, so the write is refused instead.
+  silent! write
+  assert_equal([repeat('L', 500)], readfile(BASE .. '/large.txt'),
+    'writing a deferred buffer replaced the remote file')
+
+  SimpleRemoteLoad
+  assert_true(WaitFor(() => getline(1) ==# repeat('L', 500)),
+    'the confirmed read did not land')
+  assert_equal(BASE .. '/large.txt', get(get(b:, 'vimrc_remote', {}), 'path', ''))
+  assert_true(&modifiable, 'the loaded buffer stayed read-only')
+  assert_equal('', maparg('<CR>', 'n'), 'the confirmation mapping outlived it')
+  assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+
+  # Under the limit nothing changes: the file is simply there.
+  g:simpleremote_large_file_bytes = 1048576
+  g:VimrcRemoteOpen(BASE .. '/utf8.txt')
+  assert_true(WaitFor(() => getline(1) ==# 'plain'),
+    'a small file did not open directly')
+  assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+
+  unlet g:simpleremote_large_file_bytes
+  silent! bwipeout!
+  silent! bwipeout!
+  SimpleRemoteDisconnect
+  assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
+enddef
+
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
   assert_equal(1, get(capabilities, 'bridge_protocol', 0),
@@ -237,6 +286,7 @@ def Run()
 
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
   ReadTimeoutIsReported()
+  LargeFileWaitsForConfirmation()
 
   # The same contract without any runtime: Vim drives ssh and base64 itself,
   # and bootstraps the agent through the same heredoc launcher.

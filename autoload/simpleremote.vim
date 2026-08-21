@@ -189,10 +189,17 @@ def WireLine(id: number, op: string, args: dict<any>): string
   return id .. "\t" .. op .. "\t" .. B64(LegacyPayload(op, args)) .. "\n"
 enddef
 
+def RequestTimeout(): number
+  return max([0, get(g:, 'simpleremote_request_timeout',
+    get(g:, 'vimrc_remote_request_timeout', 15000))])
+enddef
+
 # `wants_lines` asks for the reply as buffer lines — Vim's binary
 # representation, byte for byte — instead of a string that cannot hold a NUL.
+# `timeout_ms` overrides g:simpleremote_request_timeout for one request, which
+# is how a read sized in advance buys the time its size needs.
 def Send(op: string, args: dict<any>, Callback: func,
-    wants_lines: bool = false): number
+    wants_lines: bool = false, timeout_ms: number = -1): number
   if empty(s_remote) || get(s_remote, 'channel', v:null) == v:null
     Error('[VimrcRemote] not connected')
     FailRequest(Callback, wants_lines, 'not connected')
@@ -208,8 +215,7 @@ def Send(op: string, args: dict<any>, Callback: func,
   var id = s_next_id
   var key = string(id)
   var generation = s_remote.generation
-  var timeout = max([0, get(g:, 'simpleremote_request_timeout',
-    get(g:, 'vimrc_remote_request_timeout', 15000))])
+  var timeout = timeout_ms >= 0 ? timeout_ms : RequestTimeout()
   var timer = timeout > 0
         ? timer_start(timeout, (_) => RequestTimedOut(generation, key))
         : 0
@@ -890,6 +896,149 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
   })
 enddef
 
+# Above this many bytes a file is not read on sight.
+#
+# A remote read arrives as a single reply holding the whole file, so a large
+# one costs the transport, the buffer and the request timeout at once -- and
+# because the agent answers in order, everything queued behind it waits too.
+# A workspace with a 150MB metrics CSV at the top of its listing made that
+# concrete: opening the file ended in "request timed out: read", and so did
+# the next few reads. Past the limit the buffer gets a hint instead and the
+# file crosses only once the user asks for it. 0 opens everything on sight,
+# the way it always did.
+def LargeFileLimit(): number
+  return max([0, get(g:, 'simpleremote_large_file_bytes', 10485760)])
+enddef
+
+def HumanBytes(size: number): string
+  var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  var value = size * 1.0
+  var unit = 0
+  while value >= 1024.0 && unit < len(units) - 1
+    value = value / 1024.0
+    unit += 1
+  endwhile
+  return unit == 0 ? printf('%d B', size)
+    : printf('%.1f %s', value, units[unit])
+enddef
+
+# stat is not in POSIX and its two dialects disagree on the flag, which is why
+# the agent's own listing walks the same chain. wc -c reads the file to answer,
+# so it is the last resort rather than the first choice.
+#
+# The agent runs a command with its stderr merged into its output, and a login
+# shell that greets one -- "bash: warning: setlocale: LC_ALL: cannot change
+# locale" is the one that found this -- prepends that greeting to the number.
+# The answer is therefore printed on a line of its own and read back by name.
+def SizeProbeCommand(remote_path: string): string
+  var quoted = shellescape(remote_path)
+  return 'printf ''simpleremote-size %s\n'' "$('
+    .. 'stat -c %s ' .. quoted .. ' 2>/dev/null'
+    .. ' || stat -f %z ' .. quoted .. ' 2>/dev/null'
+    .. ' || wc -c < ' .. quoted .. ')"'
+enddef
+
+# The probed size, or -1 when the reply does not carry one.
+def ParseProbedSize(body: string): number
+  for line in split(body, '\n')
+    var matched = matchlist(trim(line), '^simpleremote-size\s\+\(\d\+\)$')
+    if !empty(matched)
+      return str2nr(matched[1])
+    endif
+  endfor
+  return -1
+enddef
+
+# A read whose size is known gets a timeout that size cannot outrun: the
+# configured one covers a source file, not the hundred megabytes a user
+# deliberately confirmed. Roughly 1 MiB/s, never below what is configured.
+def ReadTimeoutFor(size: number): number
+  var base = RequestTimeout()
+  return base <= 0 || size <= 0 ? base : max([base, size / 1024])
+enddef
+
+def StartRemoteRead(buf: number, generation: number, remote_path: string,
+    uri: string, timeout: number = -1)
+  var request_id = 0
+  request_id = Send('read', {path: remote_path}, (ok, body) =>
+    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body),
+    true, timeout)
+  if request_id >= 0
+    setbufvar(buf, 'vimrc_remote_read', {
+      request_id: request_id,
+      tick: getbufvar(buf, 'changedtick', -1),
+    })
+  endif
+enddef
+
+# <CR> is the confirmation the hint offers. The buffer may not be on screen
+# when the probe answers, so BufEnter installs it too.
+def MapDeferredLoad(buf: number)
+  var winid = bufwinid(buf)
+  if winid > 0
+    win_execute(winid,
+      'nnoremap <buffer><silent><nowait> <CR> <Cmd>SimpleRemoteLoad<CR>')
+  endif
+enddef
+
+def DeferLargeRead(buf: number, generation: number, remote_path: string,
+    uri: string, size: number, limit: number)
+  setbufvar(buf, 'vimrc_remote_read', {})
+  setbufvar(buf, 'vimrc_remote_deferred', {
+    path: remote_path,
+    uri: uri,
+    size: size,
+    generation: generation,
+  })
+  var lines = [
+    'SimpleRemote: this file has not been read.',
+    '',
+    '  ' .. remote_path,
+    '  ' .. HumanBytes(size) .. ', over the ' .. HumanBytes(limit)
+      .. ' g:simpleremote_large_file_bytes limit.',
+    '',
+    '  A remote read arrives as one reply holding the whole file, so this',
+    '  one would cross the transport and land in this buffer in full, with',
+    '  every request behind it waiting. Nothing has moved yet.',
+    '',
+    '  <CR>  or  :SimpleRemoteLoad    read it into this buffer anyway',
+    '  :bdelete                       leave it unread',
+  ]
+  setbufvar(buf, '&modifiable', 1)
+  var old_count = len(getbufline(buf, 1, '$'))
+  setbufline(buf, 1, lines)
+  if old_count > len(lines)
+    deletebufline(buf, len(lines) + 1, old_count)
+  endif
+  # No filetype: the hint is not the file, and the language plugins that
+  # attach on FileType have nothing to attach to yet.
+  setbufvar(buf, '&filetype', '')
+  setbufvar(buf, '&buftype', 'acwrite')
+  setbufvar(buf, '&swapfile', 0)
+  setbufvar(buf, '&modifiable', 0)
+  setbufvar(buf, '&modified', 0)
+  MapDeferredLoad(buf)
+enddef
+
+def FinishSizeProbe(buf: number, generation: number, request_id: number,
+    remote_path: string, uri: string, limit: number, ok: bool, body: string)
+  if !IsCurrent(generation) || !bufexists(buf)
+    return
+  endif
+  if get(getbufvar(buf, 'vimrc_remote_read', {}), 'request_id', -1)
+      != request_id
+    return
+  endif
+  # A size that could not be read is no reason to hold the file back: the read
+  # itself reports what is actually wrong with it, in the buffer waiting for it.
+  var size = ok ? ParseProbedSize(body) : -1
+  if size > limit
+    DeferLargeRead(buf, generation, remote_path, uri, size, limit)
+    return
+  endif
+  StartRemoteRead(buf, generation, remote_path, uri, ReadTimeoutFor(size))
+enddef
+
 def ReadRemote(uri: string)
   if empty(s_remote)
     # A session file re-edits remote:// buffers before the workspace exists;
@@ -902,13 +1051,19 @@ def ReadRemote(uri: string)
   var buf = bufnr()
   var generation = s_remote.generation
   var remote_path = substitute(uri, '^remote://', '', '')
-  var request_id = 0
-  request_id = Send('read', {path: remote_path}, (ok, body) =>
-    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body),
-    true)
-  if request_id >= 0
+  setbufvar(buf, 'vimrc_remote_deferred', {})
+  var limit = LargeFileLimit()
+  if limit <= 0
+    StartRemoteRead(buf, generation, remote_path, uri)
+    return
+  endif
+  var probe_id = 0
+  probe_id = Send('exec', {command: SizeProbeCommand(remote_path)},
+    (ok, body) => FinishSizeProbe(buf, generation, probe_id, remote_path,
+      uri, limit, ok, body))
+  if probe_id >= 0
     setbufvar(buf, 'vimrc_remote_read', {
-      request_id: request_id,
+      request_id: probe_id,
       tick: getbufvar(buf, 'changedtick', -1),
     })
   endif
@@ -961,6 +1116,12 @@ enddef
 def WriteRemote(buf: number = bufnr())
   if empty(s_remote)
     Error('[VimrcRemote] not connected')
+    return
+  endif
+  var deferred = getbufvar(buf, 'vimrc_remote_deferred', {})
+  if type(deferred) == v:t_dict && !empty(deferred)
+    Error('[VimrcRemote] ' .. get(deferred, 'path', '')
+      .. ' has not been read yet; :SimpleRemoteLoad first')
     return
   endif
   var info = getbufvar(buf, 'vimrc_remote', {})
@@ -4728,6 +4889,27 @@ def g:VimrcRemoteWrite()
   WriteRemote()
 enddef
 
+# Confirm the deferred read of the current buffer.
+def g:SimpleRemoteLoadBuffer()
+  var buf = bufnr()
+  var deferred = get(b:, 'vimrc_remote_deferred', {})
+  if type(deferred) != v:t_dict || empty(deferred)
+    Error('[VimrcRemote] this buffer has no deferred read')
+    return
+  endif
+  if empty(s_remote) || !IsCurrent(get(deferred, 'generation', -1))
+    Error('[VimrcRemote] buffer belongs to an old connection; reopen it first')
+    return
+  endif
+  b:vimrc_remote_deferred = {}
+  silent! nunmap <buffer> <CR>
+  setlocal modifiable
+  echomsg printf('[VimrcRemote] reading %s (%s)…',
+    deferred.path, HumanBytes(deferred.size))
+  StartRemoteRead(buf, deferred.generation, deferred.path, deferred.uri,
+    ReadTimeoutFor(deferred.size))
+enddef
+
 def g:VimrcRemoteExec(command: string)
   RemoteExec(command)
 enddef
@@ -4809,6 +4991,11 @@ enddef
 
 def g:VimrcRemoteActivateBuffer()
   if bufname() !~# '^remote://'
+    return
+  endif
+  var deferred = get(b:, 'vimrc_remote_deferred', {})
+  if type(deferred) == v:t_dict && !empty(deferred)
+    MapDeferredLoad(bufnr())
     return
   endif
   var pending = get(b:, 'vimrc_remote_read', {})
