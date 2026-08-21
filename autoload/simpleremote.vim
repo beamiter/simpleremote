@@ -620,23 +620,49 @@ def FinishConnection(generation: number)
   s_remote.connection_announced = true
   SetStatus(printf('%s:%s', s_remote.kind, s_remote.target))
   var mounting = ActivateWorkspace(generation)
+  # A projected workspace announces SimpleRemoteWorkspaceChanged from inside
+  # ActivateWorkspace().  Its handler has the same right to disconnect/switch
+  # synchronously as the Connected handler below.
+  if !IsCurrent(generation) || !IsReady()
+    return
+  endif
   RecordRecent()
   echomsg printf('[SimpleRemote] connected %s %s:%s',
     s_remote.kind, s_remote.target, s_remote.root)
   Emit('SimpleRemoteConnected', WorkspaceSnapshot())
+  # User handlers are allowed to disconnect or switch workspace synchronously.
+  # Everything below reads/mutates s_remote, so re-check ownership after the
+  # event instead of draining the replacement connection's open queue (or
+  # indexing an empty dictionary after a disconnect).
+  if !IsCurrent(generation) || !IsReady()
+    return
+  endif
   if get(get(s_remote, 'runtime_probe', {}), 'status', -1) != -1
     # The probe raced ahead of the handshake; announce it now that listeners
     # may act on the workspace.
     Emit('SimpleRemoteRuntimeReady', WorkspaceSnapshot())
+    if !IsCurrent(generation) || !IsReady()
+      return
+    endif
   endif
 
   var queued = copy(s_remote.open_queue)
   s_remote.open_queue = []
   for path in queued
+    if !IsCurrent(generation) || !IsReady()
+      return
+    endif
     OpenRemote(path)
+    if !IsCurrent(generation) || !IsReady()
+      return
+    endif
   endfor
   if OpenTreeOnConnect() && !mounting
-    timer_start(0, (_) => OpenWorkspaceTree())
+    timer_start(0, (_) => {
+      if IsCurrent(generation) && IsReady() && OpenTreeOnConnect()
+        OpenWorkspaceTree()
+      endif
+    })
   endif
 enddef
 
@@ -703,7 +729,11 @@ def Connect(kind: string, target: string, root: string,
     err_cb: (channel, line) => OnError(generation, channel, line),
     exit_cb: (exited_job, status) => OnExit(generation, exited_job, status),
   })
-  if job_status(job) ==# 'fail'
+  # job_start() returns a job object even when the command exits before this
+  # check.  Only `run` owns a writable transport; accepting `dead` leaves a
+  # connection that no exit callback can tear down because s_remote was not
+  # installed when that callback fired.
+  if job_status(job) !=# 'run'
     ClearGlobals()
     Error('[VimrcRemote] cannot start transport')
     return
@@ -1401,7 +1431,11 @@ def OnSshfsExit(generation: number, mountpoint: string,
     ActivateProjection(mountpoint, 'sshfs', true)
     echomsg '[SimpleRemote] SSHFS workspace ready: ' .. mountpoint
     if OpenTreeOnConnect()
-      timer_start(0, (_) => OpenWorkspaceTree())
+      timer_start(0, (_) => {
+        if IsCurrent(generation) && IsReady() && OpenTreeOnConnect()
+          OpenWorkspaceTree()
+        endif
+      })
     endif
     return
   endif
@@ -1411,7 +1445,11 @@ def OnSshfsExit(generation: number, mountpoint: string,
   # listener that acted on 'mounting' keeps waiting for a projection.
   Emit('SimpleRemoteWorkspaceChanged', WorkspaceSnapshot())
   if OpenTreeOnConnect()
-    timer_start(0, (_) => OpenWorkspaceTree())
+    timer_start(0, (_) => {
+      if IsCurrent(generation) && IsReady() && OpenTreeOnConnect()
+        OpenWorkspaceTree()
+      endif
+    })
   endif
 enddef
 
@@ -4511,8 +4549,13 @@ def g:SimpleRemoteSessionLines(): list<string>
   return ['let g:simpleremote_session_workspace = ' .. string(spec)]
 enddef
 
-def ReloadRemoteBuffersAfterConnect()
+def ReloadRemoteBuffersAfterConnect(generation: number = -1)
+  var owner = generation >= 0
+    ? generation : empty(s_remote) ? -1 : s_remote.generation
   for info in getbufinfo({bufloaded: 1})
+    if !IsCurrent(owner) || !IsReady()
+      return
+    endif
     if info.name !~# '^remote://' || get(info, 'changed', 0)
       continue
     endif
@@ -4527,6 +4570,9 @@ def ReloadRemoteBuffersAfterConnect()
       # Unloaded, the buffer goes through its BufReadCmd (ReadRemote) again
       # the next time a window shows it.
       execute 'silent! bunload ' .. info.bufnr
+    endif
+    if !IsCurrent(owner) || !IsReady()
+      return
     endif
   endfor
 enddef
@@ -4559,9 +4605,10 @@ def g:SimpleRemoteReloadSessionBuffers()
   # Called from the Connected autocmd: `:edit` from inside an autocmd would not
   # trigger the BufReadCmd that actually fetches the file, so leave the
   # autocmd context first.
+  var generation = empty(s_remote) ? -1 : s_remote.generation
   timer_start(0, (_) => {
-    if IsReady()
-      ReloadRemoteBuffersAfterConnect()
+    if IsCurrent(generation) && IsReady()
+      ReloadRemoteBuffersAfterConnect(generation)
     endif
   })
 enddef
@@ -4971,8 +5018,17 @@ def g:VimrcRemoteReloadConfig()
         var queued = copy(s_remote.open_queue)
         s_remote.open_queue = []
         for path in queued
+          if !IsCurrent(generation) || !IsReady()
+            return
+          endif
           OpenRemote(path)
+          if !IsCurrent(generation) || !IsReady()
+            return
+          endif
         endfor
+      endif
+      if !IsCurrent(generation) || !IsReady()
+        return
       endif
       if applied
         AnnounceConfigChanged()

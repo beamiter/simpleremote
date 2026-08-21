@@ -124,6 +124,12 @@ Remote commands automatically prepend project `.venv`, `.conda`, `venv`, and
 project Python environments, and user-installed language servers available to
 non-login SSH sessions without sourcing interactive shell files into LSP stdio.
 
+SSH ControlMaster sockets live in a private `0700` directory below
+`$XDG_RUNTIME_DIR` (or the per-user temporary fallback). Existing secure
+directories are reused without a permission rewrite. The fallback is keyed by
+the effective uid (not `$USER`), and symlinked, wrongly owned, or replaceable
+runtime path components are rejected before a socket is created.
+
 ## SimpleTree-compatible virtual tree
 
 The virtual remote tree now follows almost the complete SimpleTree key

@@ -25,7 +25,7 @@ mod transfer;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -40,6 +40,15 @@ pub const BRIDGE_PROTOCOL: u32 = 1;
 /// The heredoc delimiter used to ship the agent script through the transport.
 /// The agent must never contain this line; the bootstrap builder checks.
 const AGENT_HEREDOC: &str = "SIMPLEREMOTE_AGENT_EOF";
+
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid() takes no arguments and has no failure mode on Unix.
+    unsafe { geteuid() }
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct RuntimeArgs {
@@ -402,30 +411,141 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 fn control_path(target: &str) -> Result<PathBuf, String> {
-    let base = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
-            PathBuf::from(format!("/tmp/simpleremote-{user}"))
-        })
-        .join("simpleremote");
+    let uid = effective_uid();
+    let root = match env::var_os("XDG_RUNTIME_DIR") {
+        Some(value) => {
+            let root = PathBuf::from(value);
+            if !root.is_absolute() {
+                return Err("XDG_RUNTIME_DIR must be an absolute path".to_string());
+            }
+            validate_private_root(&root, uid)?;
+            root
+        }
+        None => {
+            // Resolve the platform temp directory once (macOS commonly spells
+            // /tmp through a symlink), then atomically claim a uid-named entry
+            // in that sticky directory.  USER is environment input and can be
+            // spoofed or collide; the effective uid is the ownership boundary.
+            let temporary = fs::canonicalize(env::temp_dir())
+                .map_err(|error| format!("cannot resolve the temporary directory: {error}"))?;
+            validate_safe_chain(&temporary, uid)?;
+            let root = temporary.join(format!("simpleremote-{uid}"));
+            ensure_private_dir(&root)?;
+            root
+        }
+    };
+    let base = root.join("simpleremote");
     ensure_private_dir(&base)?;
     Ok(base.join(format!("{:016x}.sock", fnv1a(target.as_bytes()))))
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|error| {
+fn validate_directory(path: &Path) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         format!(
-            "cannot create runtime directory {}: {error}",
+            "cannot inspect runtime directory {}: {error}",
             path.display()
         )
     })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        format!(
-            "cannot secure runtime directory {}: {error}",
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "runtime directory {} is not a real directory",
             path.display()
-        )
-    })
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Every existing component is a real directory, and no non-sticky component
+/// lets another user replace entries below it.  A sticky shared temp directory
+/// is safe once the child itself is ownership-checked: another uid may create
+/// a colliding entry first, but cannot replace one owned by this uid.
+fn validate_safe_chain(path: &Path, uid: u32) -> Result<(), String> {
+    let system_uid = validate_directory(Path::new("/"))?.uid();
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = validate_directory(&current)?;
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != system_uid && metadata.uid() != uid {
+            return Err(format!(
+                "runtime path component {} is owned by unexpected uid {}",
+                current.display(),
+                metadata.uid()
+            ));
+        }
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(format!(
+                "runtime path component {} is writable by other users",
+                current.display()
+            ));
+        }
+        // The final private directory is checked more strictly below.  For an
+        // ancestor, a different owner is normal (/ and /run are root-owned),
+        // provided its mode made replacement impossible.
+    }
+    Ok(())
+}
+
+fn validate_private_root(path: &Path, uid: u32) -> Result<(), String> {
+    validate_safe_chain(path, uid)?;
+    let metadata = validate_directory(path)?;
+    if metadata.uid() != uid {
+        return Err(format!(
+            "runtime directory {} is owned by uid {}, expected {uid}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "runtime directory {} is accessible by other users",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("runtime directory {} has no parent", path.display()))?;
+    validate_safe_chain(parent, effective_uid())?;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create runtime directory {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    let metadata = validate_directory(path)?;
+    let uid = effective_uid();
+    if metadata.uid() != uid {
+        return Err(format!(
+            "runtime directory {} is owned by uid {}, expected {uid}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+
+    // The parent chain is now immutable to other users (or protected by sticky
+    // ownership), so the metadata-to-chmod interval cannot be swapped by the
+    // cross-user attacker this boundary excludes.
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "cannot secure runtime directory {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -440,6 +560,17 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "simpleremote-{label}-{}-{}",
+            std::process::id(),
+            TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn args(kind: &str) -> RuntimeArgs {
         RuntimeArgs {
@@ -554,6 +685,60 @@ mod tests {
         let source = concat!(env!("CARGO_MANIFEST_DIR"), "/bin/simpleremote-agent.sh");
         let content = fs::read_to_string(source).unwrap();
         assert!(agent_bootstrap_script("~/agent.sh", &content).is_ok());
+    }
+
+    #[test]
+    fn runtime_directory_is_private_and_never_follows_a_symlink() {
+        let directory = test_path("runtime-mode");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&directory).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let target = test_path("runtime-target");
+        let link = test_path("runtime-link");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(ensure_private_dir(&link).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "rejecting a runtime symlink must not chmod its target"
+        );
+
+        fs::remove_file(link).unwrap();
+        fs::remove_dir(target).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_directory_rejects_unsafe_or_symlinked_ancestors() {
+        let real_parent = test_path("runtime-real-parent");
+        let linked_parent = test_path("runtime-linked-parent");
+        fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let through_link = linked_parent.join("child");
+        assert!(ensure_private_dir(&through_link).is_err());
+        assert!(!through_link.exists());
+
+        fs::remove_file(&linked_parent).unwrap();
+        fs::remove_dir(&real_parent).unwrap();
+
+        let writable_parent = test_path("runtime-writable-parent");
+        fs::create_dir(&writable_parent).unwrap();
+        fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let below_writable = writable_parent.join("child");
+        assert!(ensure_private_dir(&below_writable).is_err());
+        assert!(!below_writable.exists());
+        fs::remove_dir(&writable_parent).unwrap();
     }
 
     #[test]

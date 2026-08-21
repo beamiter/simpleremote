@@ -163,6 +163,72 @@ def Run()
   assert_true(g:SimpleRemoteTreeSetRoot(CHILD))
   assert_true(WaitForRoot(CHILD), 'remote-tree root did not switch workspace')
   assert_true(WaitForConfig('child'), 'remote-tree workspace config was not loaded')
+
+  # Opening the first queued buffer runs ordinary BufEnter handlers.  If one
+  # switches workspace synchronously, the old generation must not continue
+  # draining its remaining paths into the replacement connection.
+  writefile(['first'], BASE .. '/queued-first.txt')
+  writefile(['second'], BASE .. '/queued-second.txt')
+  SimpleRemoteDisconnect
+  g:queued_switch_target = TARGET
+  g:queued_switch_root = CHILD
+  def g:SwitchWorkspaceFromQueuedOpen()
+    execute 'SimpleRemoteConnect ssh ' .. g:queued_switch_target
+      .. ' ' .. fnameescape(g:queued_switch_root)
+  enddef
+  augroup SimpleRemoteQueuedOpenSwitch
+    autocmd!
+    autocmd BufEnter remote://* ++once call g:SwitchWorkspaceFromQueuedOpen()
+  augroup END
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  g:VimrcRemoteOpen(BASE .. '/queued-first.txt')
+  g:VimrcRemoteOpen(BASE .. '/queued-second.txt')
+  assert_true(WaitForRoot(CHILD), 'queued open did not switch workspace')
+  sleep 100m
+  assert_equal(-1, bufnr('remote://' .. BASE .. '/queued-second.txt'),
+    'old queued path leaked into the replacement workspace')
+  augroup SimpleRemoteQueuedOpenSwitch
+    autocmd!
+  augroup END
+  delfunction g:SwitchWorkspaceFromQueuedOpen
+  unlet g:queued_switch_target g:queued_switch_root
+
+  # WorkspaceChanged is emitted synchronously from projection activation,
+  # before Connected.  It has the same re-entrant contract as every public
+  # event: disconnecting there must stop FinishConnection immediately.
+  SimpleRemoteDisconnect
+  augroup SimpleRemoteReentrantWorkspaceChanged
+    autocmd!
+    autocmd User SimpleRemoteWorkspaceChanged ++once SimpleRemoteDisconnect
+  augroup END
+  v:errmsg = ''
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'),
+    'WorkspaceChanged handler did not disconnect reentrantly')
+  sleep 50m
+  assert_notmatch('E716\|E1065', v:errmsg,
+    'FinishConnection touched the workspace after WorkspaceChanged replaced it')
+  augroup SimpleRemoteReentrantWorkspaceChanged
+    autocmd!
+  augroup END
+
+  # Connected is a public synchronous event.  A listener may immediately
+  # disconnect (or connect another workspace); FinishConnection must not keep
+  # using the old generation after that handler returns.
+  augroup SimpleRemoteReentrantDisconnect
+    autocmd!
+    autocmd User SimpleRemoteConnected ++once SimpleRemoteDisconnect
+  augroup END
+  v:errmsg = ''
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'),
+    'Connected handler did not disconnect reentrantly')
+  sleep 50m
+  assert_notmatch('E716\|E1065', v:errmsg,
+    'FinishConnection touched the workspace after its Connected handler replaced it')
+  augroup SimpleRemoteReentrantDisconnect
+    autocmd!
+  augroup END
 enddef
 
 var failure = ''

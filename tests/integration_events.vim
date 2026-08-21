@@ -361,6 +361,25 @@ def Run()
   assert_true(WaitFor(() => getbufline(reopened, 1) ==# ['alpha']),
     'session restore did not re-read the remote buffer')
   assert_false(exists('g:simpleremote_session_workspace'))
+
+  # RuntimeReady is synchronous whether the probe wins or loses the handshake
+  # race.  A listener may disconnect immediately; FinishConnection must not
+  # continue into the old open queue afterwards.
+  SimpleRemoteDisconnect
+  augroup SimpleRemoteRuntimeReadyDisconnect
+    autocmd!
+    autocmd User SimpleRemoteRuntimeReady ++once SimpleRemoteDisconnect
+  augroup END
+  v:errmsg = ''
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'),
+    'RuntimeReady handler did not disconnect reentrantly')
+  sleep 50m
+  assert_notmatch('E716\|E1065', v:errmsg,
+    'connection state was used after RuntimeReady disconnected it')
+  augroup SimpleRemoteRuntimeReadyDisconnect
+    autocmd!
+  augroup END
 enddef
 
 var failure = ''
