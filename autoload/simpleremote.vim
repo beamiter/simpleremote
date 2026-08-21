@@ -136,13 +136,25 @@ def StopRequestTimer(entry: dict<any>)
   endif
 enddef
 
+# A failure has to reach the callback in the shape that callback was declared
+# for.  A wants_lines request types its payload list<string>, so handing it a
+# bare message aborts with E1013 and hides the real failure; OnLine() already
+# wraps an error reply the same way.
+def FailRequest(Callback: func, wants_lines: bool, message: string)
+  if wants_lines
+    call(Callback, [false, [message]])
+  else
+    call(Callback, [false, message])
+  endif
+enddef
+
 def RequestTimedOut(generation: number, key: string)
   if !IsCurrent(generation) || !has_key(s_remote.pending, key)
     return
   endif
   var entry = remove(s_remote.pending, key)
-  var Callback = entry.callback
-  call(Callback, [false, 'request timed out: ' .. entry.operation])
+  FailRequest(entry.callback, get(entry, 'wants_lines', false),
+    'request timed out: ' .. entry.operation)
 enddef
 
 # The agent's line protocol carries one base64 payload per request.  With the
@@ -183,12 +195,12 @@ def Send(op: string, args: dict<any>, Callback: func,
     wants_lines: bool = false): number
   if empty(s_remote) || get(s_remote, 'channel', v:null) == v:null
     Error('[VimrcRemote] not connected')
-    call(Callback, [false, 'not connected'])
+    FailRequest(Callback, wants_lines, 'not connected')
     return -1
   endif
   if ch_status(s_remote.channel) !=# 'open'
     Error('[VimrcRemote] transport is not writable')
-    call(Callback, [false, 'transport is not writable'])
+    FailRequest(Callback, wants_lines, 'transport is not writable')
     return -1
   endif
 
@@ -196,7 +208,8 @@ def Send(op: string, args: dict<any>, Callback: func,
   var id = s_next_id
   var key = string(id)
   var generation = s_remote.generation
-  var timeout = max([0, get(g:, 'vimrc_remote_request_timeout', 15000)])
+  var timeout = max([0, get(g:, 'simpleremote_request_timeout',
+    get(g:, 'vimrc_remote_request_timeout', 15000))])
   var timer = timeout > 0
         ? timer_start(timeout, (_) => RequestTimedOut(generation, key))
         : 0
@@ -219,7 +232,7 @@ def Send(op: string, args: dict<any>, Callback: func,
     # already completed every pending callback, so never invoke this one twice.
     if failed_here
       Error('[VimrcRemote] transport is not writable')
-      call(Callback, [false, 'transport is not writable'])
+      FailRequest(Callback, wants_lines, 'transport is not writable')
     endif
     return -1
   endtry
@@ -301,8 +314,7 @@ enddef
 def FailPending(remote: dict<any>, message: string)
   for entry in values(get(remote, 'pending', {}))
     StopRequestTimer(entry)
-    var Callback = entry.callback
-    call(Callback, [false, message])
+    FailRequest(entry.callback, get(entry, 'wants_lines', false), message)
   endfor
 enddef
 

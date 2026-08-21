@@ -196,6 +196,39 @@ def Exercise(protocol: string, agent: string)
   assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
 enddef
 
+def MessagesMatch(pattern: string): bool
+  return execute('messages') =~# pattern
+enddef
+
+# A request that fails has to reach its callback in the shape that callback
+# was declared for.  The buffer read types its payload list<string>, so a bare
+# message aborted the timeout timer with E1013 and hid the timeout itself.
+# Nothing here is protocol specific, so one transport proves it.
+def ReadTimeoutIsReported()
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(Ready), 'timeout: workspace did not become ready')
+
+  # The agent answers one request per line, in order, so this sleep keeps the
+  # read behind it queued well past the timeout below.
+  var slept = false
+  g:SimpleRemoteExecute('sleep 2', (ok, text) => {
+    slept = true
+  })
+  g:simpleremote_request_timeout = 200
+  messages clear
+  g:VimrcRemoteOpen(BASE .. '/utf8.txt')
+  assert_true(WaitFor(() => MessagesMatch('request timed out: read'), 3.0),
+    'timed-out read did not report the timeout: ' .. execute('messages'))
+  assert_false(MessagesMatch('E1013'),
+    'timed-out read aborted with a type error: ' .. execute('messages'))
+
+  unlet g:simpleremote_request_timeout
+  assert_true(WaitFor(() => slept), 'the blocking command never finished')
+  silent! bwipeout!
+  SimpleRemoteDisconnect
+  assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
+enddef
+
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
   assert_equal(1, get(capabilities, 'bridge_protocol', 0),
@@ -203,6 +236,7 @@ def Run()
   assert_true(index(get(capabilities, 'actions', []), 'upload') >= 0)
 
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
+  ReadTimeoutIsReported()
 
   # The same contract without any runtime: Vim drives ssh and base64 itself,
   # and bootstraps the agent through the same heredoc launcher.

@@ -113,6 +113,12 @@ Options:
                                       (default ~/.cache/vimrc/simpleremote-agent.sh)
   g:simpleremote_agent_source         local agent script shipped to targets
                                       (default bin/simpleremote-agent.sh)
+  g:simpleremote_request_timeout      milliseconds a single agent request may
+                                      take before it fails as "request timed
+                                      out" (default 15000, 0 waits forever).
+                                      Raise it for large remote files: the
+                                      whole body travels as one reply, so a
+                                      slow link can outlast the default.
 
 The key for g:simpleremote_local_roots is "kind:target:/remote/root".
 
