@@ -306,7 +306,9 @@ fn finish_record(
 fn encode_payload(request: &Request) -> Result<String, String> {
     let raw: Vec<u8> = match request.op.as_str() {
         "ping" => Vec::new(),
-        "read" | "read-config" | "list" | "list-meta" => request.path.as_bytes().to_vec(),
+        "read" | "read-config" | "list" | "list-meta" | "list-encoded" | "list-meta-encoded" => {
+            request.path.as_bytes().to_vec()
+        }
         "exec" | "grep" => request.command.as_bytes().to_vec(),
         "write" => {
             if request.path.is_empty() {
@@ -537,6 +539,15 @@ mod tests {
         );
         assert_eq!(
             decode(&encode_payload(&request(r#"{"id":2,"op":"read","path":"/a b"}"#)).unwrap()),
+            b"/a b"
+        );
+        assert_eq!(
+            decode(
+                &encode_payload(&request(
+                    r#"{"id":6,"op":"list-meta-encoded","path":"/a b"}"#
+                ))
+                .unwrap()
+            ),
             b"/a b"
         );
         assert_eq!(

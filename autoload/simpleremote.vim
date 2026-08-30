@@ -245,6 +245,62 @@ def Send(op: string, args: dict<any>, Callback: func,
   return id
 enddef
 
+# New agents encode the filename field inside directory-listing rows.  Keep
+# the protocol revision stable and negotiate by operation name: an old agent
+# answers "unknown operation", at which point the next legacy operation is
+# tried.  Conversely, the new agent still serves those legacy operations.
+def SendDirectoryListingAttempt(path: string, attempts: list<dict<any>>,
+    index: number, Callback: func): number
+  var attempt = attempts[index]
+  var generation = get(s_remote, 'generation', -1)
+  return Send(attempt.operation, {path: path}, (ok, body) => {
+    var unknown = !ok && body =~# '^unknown operation:'
+    if IsCurrent(generation)
+      # Operation support belongs to the agent process, hence to this
+      # connection generation.  Remember both positive and negative probes so
+      # an old agent pays the compatibility fallback only once rather than
+      # once for every directory expanded in the tree.
+      if !has_key(s_remote, 'listing_operations')
+        s_remote.listing_operations = {}
+      endif
+      s_remote.listing_operations[attempt.operation] = unknown ? 0 : 1
+    endif
+    if unknown && index + 1 < len(attempts)
+      SendDirectoryListingAttempt(path, attempts, index + 1, Callback)
+      return
+    endif
+    call(Callback, [ok, body, attempt])
+  })
+enddef
+
+def SendDirectoryListing(path: string, metadata: bool, Callback: func): number
+  var attempts = metadata
+    ? [
+        {operation: 'list-meta-encoded', encoded: true, metadata: true},
+        {operation: 'list-meta', encoded: false, metadata: true},
+        {operation: 'list-encoded', encoded: true, metadata: false},
+        {operation: 'list', encoded: false, metadata: false},
+      ]
+    : [
+        {operation: 'list-encoded', encoded: true, metadata: false},
+        {operation: 'list', encoded: false, metadata: false},
+      ]
+  var support = get(s_remote, 'listing_operations', {})
+  filter(attempts,
+    (_, attempt) => get(support, attempt.operation, -1) != 0)
+  # `list` is part of every v2 agent.  Keep a deterministic request even if a
+  # broken peer previously claimed otherwise, so callers receive its concrete
+  # error instead of an indexing exception here.
+  if empty(attempts)
+    attempts = [{operation: 'list', encoded: false, metadata: false}]
+  endif
+  return SendDirectoryListingAttempt(path, attempts, 0, Callback)
+enddef
+
+def ListingName(field: string, encoded: bool): string
+  return encoded ? UnB64(field) : field
+enddef
+
 # Every reply reaches its callback fully decoded: file bodies for read and
 # read-config, listings, command output, or an error message.
 def DecodeLine(line: string): dict<any>
@@ -743,6 +799,7 @@ def Connect(kind: string, target: string, root: string,
     job: job,
     channel: job_getchannel(job),
     pending: {},
+    listing_operations: {},
     stderr: [],
     generation: generation,
     kind: kind,
@@ -1216,7 +1273,7 @@ enddef
 def RemoteList(path: string)
   var remote_path = path ==# '' ? s_remote.root
         : path =~# '^/' ? path : JoinRemotePath(s_remote.root, path)
-  Send('list', {path: remote_path}, (ok, body) => {
+  SendDirectoryListing(remote_path, false, (ok, body, info) => {
     if !ok
       Error('[VimrcRemote] ' .. body)
       return
@@ -1227,13 +1284,17 @@ def RemoteList(path: string)
       if len(fields) < 2 || empty(fields[0])
         continue
       endif
+      var name = ListingName(fields[0], !!get(info, 'encoded', false))
+      if empty(name)
+        continue
+      endif
       if fields[1] ==# 'd'
         # Directories are headings, not buffers.  Drill down explicitly with
         # :VimrcRemoteList path instead of opening a guaranteed read error.
-        add(items, {text: fields[0] .. '/', valid: 0})
+        add(items, {text: name .. '/', valid: 0})
       else
-        var child = JoinRemotePath(remote_path, fields[0])
-        add(items, {filename: 'remote://' .. child, text: fields[0]})
+        var child = JoinRemotePath(remote_path, name)
+        add(items, {filename: 'remote://' .. child, text: name})
       endif
     endfor
     setqflist([], ' ', {title: 'Remote tree: ' .. remote_path, items: items})
@@ -1901,16 +1962,21 @@ def TreeNodeCompare(left: dict<any>, right: dict<any>): number
   return get(s_tree, 'sort_reverse', false) ? -result : result
 enddef
 
-def ParseTreeDirectory(path: string, body: string): list<dict<any>>
+def ParseTreeDirectory(path: string, body: string,
+    encoded: bool = false): list<dict<any>>
   var nodes: list<dict<any>> = []
   for line in split(body, '\n')
     var fields = split(line, "\t", 1)
-    if len(fields) < 2 || empty(fields[0]) || TreeIgnored(fields[0])
+    if len(fields) < 2 || empty(fields[0])
+      continue
+    endif
+    var name = ListingName(fields[0], encoded)
+    if empty(name) || TreeIgnored(name)
       continue
     endif
     var node = {
-      name: fields[0],
-      path: JoinRemotePath(path, fields[0]),
+      name: name,
+      path: JoinRemotePath(path, name),
       type: fields[1],
       size: len(fields) > 2 ? str2nr(fields[2]) : -1,
       mtime: len(fields) > 3 ? str2nr(fields[3]) : -1,
@@ -2200,7 +2266,7 @@ def RenderRemoteTree(buf: number)
 enddef
 
 def OnTreeList(generation: number, epoch: number, buf: number, path: string,
-    metadata: bool, ok: bool, body: string)
+    metadata_requested: bool, ok: bool, body: string, info: dict<any>)
   if !IsCurrent(generation) || !bufexists(buf) || empty(s_tree)
         || s_tree.buf != buf || s_tree.epoch != epoch
     return
@@ -2209,18 +2275,14 @@ def OnTreeList(generation: number, epoch: number, buf: number, path: string,
     remove(s_tree.loading, path)
   endif
   if ok
-    if metadata
-      s_tree.metadata_supported = 1
+    if metadata_requested
+      s_tree.metadata_supported = !!get(info, 'metadata', false) ? 1 : 0
     endif
-    s_tree.cache[path] = ParseTreeDirectory(path, body)
+    s_tree.cache[path] = ParseTreeDirectory(path, body,
+      !!get(info, 'encoded', false))
     if has_key(s_tree.errors, path)
       remove(s_tree.errors, path)
     endif
-  elseif metadata && body =~# '^unknown operation:'
-    # Older installed agents remain usable; only size/mtime sorting degrades.
-    s_tree.metadata_supported = 0
-    LoadTreeDirectory(path, true)
-    return
   else
     s_tree.errors[path] = body
   endif
@@ -2245,8 +2307,9 @@ def LoadTreeDirectory(path: string, force: bool = false)
   var metadata = index(['mtime', 'size'], TreeSortMode()) >= 0
     && get(s_tree, 'metadata_supported', -1) != 0
   RenderRemoteTree(buf)
-  Send(metadata ? 'list-meta' : 'list', {path: path},
-    (ok, body) => OnTreeList(generation, epoch, buf, path, metadata, ok, body))
+  SendDirectoryListing(path, metadata,
+    (ok, body, info) => OnTreeList(
+      generation, epoch, buf, path, metadata, ok, body, info))
 enddef
 
 def LoadRemoteTree(path: string)
@@ -4722,16 +4785,21 @@ enddef
 
 # A multi-line dict literal inside a lambda block does not compile (E723) and
 # takes the enclosing function down silently, so listing rows are built here.
-def ParseDirectoryListing(remote_path: string, body: string): list<dict<any>>
+def ParseDirectoryListing(remote_path: string, body: string,
+    encoded: bool = false): list<dict<any>>
   var entries: list<dict<any>> = []
   for line in split(body, '\n')
     var fields = split(line, "\t", 1)
     if len(fields) < 2 || empty(fields[0])
       continue
     endif
+    var name = ListingName(fields[0], encoded)
+    if empty(name)
+      continue
+    endif
     add(entries, {
-      name: fields[0],
-      path: JoinRemotePath(remote_path, fields[0]),
+      name: name,
+      path: JoinRemotePath(remote_path, name),
       type: fields[1],
       size: len(fields) > 2 ? str2nr(fields[2]) : -1,
       mtime: len(fields) > 3 ? str2nr(fields[3]) : -1,
@@ -4753,8 +4821,10 @@ def g:SimpleRemoteListDirectory(path: string, Callback: func): number
     call(Callback, [false, 'remote path is outside the active workspace'])
     return -1
   endif
-  return Send('list-meta', {path: remote_path}, (ok, body) => {
-    call(Callback, [ok, ok ? ParseDirectoryListing(remote_path, body) : body])
+  return SendDirectoryListing(remote_path, true, (ok, body, info) => {
+    call(Callback, [ok,
+      ok ? ParseDirectoryListing(remote_path, body,
+        !!get(info, 'encoded', false)) : body])
   })
 enddef
 

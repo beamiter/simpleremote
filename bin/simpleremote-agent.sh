@@ -76,6 +76,7 @@ encode_file() {
 list_directory() {
   list_root=$1
   list_meta=${2:-0}
+  list_encoded=${3:-0}
   for list_entry in "$list_root"/* "$list_root"/.[!.]* "$list_root"/..?*; do
     if [ ! -e "$list_entry" ] && [ ! -L "$list_entry" ]; then
       continue
@@ -88,6 +89,15 @@ list_directory() {
     else
       list_kind=f
     fi
+    if [ "$list_encoded" -eq 1 ]; then
+      # Only the filename needs an inner encoding.  Base64 contains neither a
+      # tab nor a newline, so every legal pathname remains exactly one field
+      # in exactly one row.  Stream it: command substitution would strip a
+      # trailing newline which is a legal final byte of a Unix filename.
+      printf '%s' "$list_name" | encode
+    else
+      printf '%s' "$list_name"
+    fi
     if [ "$list_meta" -eq 1 ]; then
       if list_metadata=$(stat -c '%s %Y' "$list_entry" 2>/dev/null); then
         :
@@ -98,10 +108,9 @@ list_directory() {
       fi
       list_size=${list_metadata%% *}
       list_mtime=${list_metadata#* }
-      printf '%s\t%s\t%s\t%s\n' \
-        "$list_name" "$list_kind" "$list_size" "$list_mtime"
+      printf '\t%s\t%s\t%s\n' "$list_kind" "$list_size" "$list_mtime"
     else
-      printf '%s\t%s\n' "$list_name" "$list_kind"
+      printf '\t%s\n' "$list_kind"
     fi
   done 2>/dev/null
 }
@@ -201,7 +210,7 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "cannot replace: $path"
       fi
       ;;
-    list|list-meta)
+    list|list-meta|list-encoded|list-meta-encoded)
       if ! path=$(decode "${payload:-}"); then
         reply "$id" error "invalid list payload"
         continue
@@ -216,8 +225,14 @@ while IFS="$tab" read -r id op payload; do
           continue
         }
         list_with_meta=0
-        [ "$op" != list-meta ] || list_with_meta=1
-        if list_directory "$path" "$list_with_meta" >"$list_output"; then
+        list_names_encoded=0
+        case "$op" in
+          list-meta|list-meta-encoded) list_with_meta=1 ;;
+        esac
+        case "$op" in
+          list-encoded|list-meta-encoded) list_names_encoded=1 ;;
+        esac
+        if list_directory "$path" "$list_with_meta" "$list_names_encoded" >"$list_output"; then
           reply_stream "$id" ok <"$list_output"
         else
           reply "$id" error "cannot list directory: $path"

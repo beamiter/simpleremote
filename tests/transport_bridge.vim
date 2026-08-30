@@ -17,6 +17,8 @@ writefile(['plain', 'text ✓'], BASE .. '/utf8.txt')
 writefile(0zC3A9FFFE0A, BASE .. '/latin.bin')
 writefile(['inner'], BASE .. '/dir/inner/deep.txt')
 writefile(['top'], BASE .. '/dir/top.txt')
+writefile(['tab'], BASE .. "/dir/tab\tname.txt")
+writefile(['newline'], BASE .. "/dir/line\nname.txt")
 writefile(['local file'], BASE .. '/local/up.txt')
 writefile([repeat('L', 500)], BASE .. '/large.txt')
 mkdir(BASE .. '/local/tree/sub', 'p')
@@ -124,7 +126,8 @@ def Exercise(protocol: string, agent: string)
   assert_equal(v:t_list, type(listing))
   var names = mapnew(listing, (_, entry) => entry.name .. ':' .. entry.type)
   sort(names)
-  assert_equal(['inner:d', 'top.txt:f'], names)
+  assert_equal(['inner:d', "line\nname.txt:f", "tab\tname.txt:f", 'top.txt:f'],
+    names, protocol .. ': legal tab/newline filename was split into listing rows')
   assert_true(listing[0].size >= 0 && listing[0].mtime > 0,
     protocol .. ': list-meta fields are missing')
 
@@ -319,6 +322,76 @@ def MalformedRequestsAreAnswered()
   assert_true(WaitFor(() => job_status(job) !=# 'run'), 'the bridge did not exit')
 enddef
 
+# A new agent must still serve the operation names an old Vim side sends.
+def BundledAgentKeepsLegacyListingOperations()
+  var replies: list<string> = []
+  var job = job_start([REPO .. '/bin/simpleremote-agent.sh'], {
+    in_io: 'pipe', out_io: 'pipe', err_io: 'pipe', out_mode: 'nl', err_mode: 'nl',
+    out_cb: (_, line) => add(replies, line),
+  })
+  assert_equal('run', job_status(job), 'bundled agent did not start directly')
+  var payload = system('base64', BASE .. '/dir')->substitute('\n', '', 'g')
+  ch_sendraw(job_getchannel(job), "71\tlist-meta\t" .. payload .. "\n")
+  assert_true(WaitFor(() => !empty(replies)), 'legacy list-meta was not answered')
+  var fields = split(replies[0], "\t", 1)
+  assert_equal(3, len(fields), 'legacy list-meta reply framing changed')
+  assert_equal('ok', fields[1])
+  var listing = system('base64 -d', fields[2])
+  assert_match('top\.txt\tf\t', listing,
+    'new bundled agent no longer serves an old client list-meta request')
+  job_stop(job, 'kill')
+  assert_true(WaitFor(() => job_status(job) !=# 'run'))
+enddef
+
+# The inverse upgrade order: an old agent rejects the encoded operation, and
+# the new Vim side retries list-meta without losing metadata.
+def OldAgentListingFallbackWorks()
+  var prior_agent = g:simpleremote_agent
+  var prior_daemon = g:simpleremote_use_daemon
+  var prior_op_log = $SIMPLEREMOTE_TEST_LEGACY_OP_LOG
+  var op_log = tempname()
+  $SIMPLEREMOTE_TEST_LEGACY_OP_LOG = op_log
+  var old_agent = REPO .. '/tests/fixtures/legacy-list-agent.sh'
+  setfperm(old_agent, 'rwxr-xr-x')
+  try
+    g:simpleremote_use_daemon = 0
+    g:simpleremote_agent = old_agent
+    g:simpleremote_agent_source = BASE .. '/missing-agent-source'
+    execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+    assert_true(WaitFor(Ready), 'old-agent fallback workspace did not become ready')
+
+    var done = false
+    var listing: any = []
+    g:SimpleRemoteListDirectory('dir', (ok, entries) => {
+      listing = ok ? entries : 'ERR ' .. string(entries)
+      done = true
+    })
+    assert_true(WaitFor(() => done), 'old-agent listing fallback did not finish')
+    assert_equal(v:t_list, type(listing), string(listing))
+    assert_equal('legacy.txt', listing[0].name)
+    assert_equal(6, listing[0].size)
+    assert_equal(123, listing[0].mtime)
+
+    done = false
+    g:SimpleRemoteListDirectory('dir', (ok, entries) => {
+      listing = ok ? entries : 'ERR ' .. string(entries)
+      done = true
+    })
+    assert_true(WaitFor(() => done), 'cached old-agent listing did not finish')
+    assert_equal(1, count(readfile(op_log), 'list-meta-encoded'),
+      'encoded-list support was probed again after the old agent rejected it')
+    assert_equal(2, count(readfile(op_log), 'list-meta'),
+      'the cached fallback did not use list-meta directly')
+  finally
+    silent! SimpleRemoteDisconnect
+    unlet! g:simpleremote_agent_source
+    g:simpleremote_agent = prior_agent
+    g:simpleremote_use_daemon = prior_daemon
+    $SIMPLEREMOTE_TEST_LEGACY_OP_LOG = prior_op_log
+    delete(op_log)
+  endtry
+enddef
+
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
   assert_equal(1, get(capabilities, 'bridge_protocol', 0),
@@ -326,6 +399,7 @@ def Run()
   assert_true(index(get(capabilities, 'actions', []), 'upload') >= 0)
 
   MalformedRequestsAreAnswered()
+  BundledAgentKeepsLegacyListingOperations()
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
   ReadTimeoutIsReported()
   LargeFileWaitsForConfirmation()
@@ -335,6 +409,7 @@ def Run()
   g:simpleremote_use_daemon = 0
   g:simpleremote_agent = AGENT_DIR .. '/legacy/simpleremote-agent.sh'
   Exercise('legacy', AGENT_DIR .. '/legacy/simpleremote-agent.sh')
+  OldAgentListingFallbackWorks()
 
   # An installed agent that drifted is replaced on the next connection.
   writefile(['#!/bin/sh', 'exit 9'], AGENT_DIR .. '/legacy/simpleremote-agent.sh')
