@@ -371,6 +371,21 @@ one process per connection, command, probe or transfer.
              binary and falls back to the older exec-agent behaviour when
              the runtime predates the bridge, so a plugin update that outran
              `install.sh` still connects.
+  --self-test
+             exercise the bridge's encoders, the transport assembly and the
+             private runtime directory in-process, then exit.  `install.sh`
+             runs it on the freshly built binary and refuses to replace a
+             working daemon when it fails: a version string is printed just
+             as happily by a half-linked build.
+
+Every request line the bridge reads produces exactly one reply line, a line
+it cannot parse included.  The `id` survives the common failure — one field
+with the wrong type — and comes back with an error, instead of leaving the
+caller's request unanswered until its timeout.  Both directions are read with
+a bounded reader, since Vim's channel can die mid-write and the reply side
+carries bytes from another machine: a record with no newline in it is
+reported and discarded rather than grown, and the next record is still
+served.
 
 The remote agent is self-installing: every connection ships the bundled
 `bin/simpleremote-agent.sh` inside the launch command, compares it with the

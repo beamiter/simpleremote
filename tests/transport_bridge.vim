@@ -278,12 +278,54 @@ def LargeFileWaitsForConfirmation()
   assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))
 enddef
 
+# A request line the bridge cannot parse used to be reported on stderr and
+# nothing else, so Vim's pending entry for it was resolved only by the request
+# timeout — a write that neither succeeded nor failed.  The id is in the line;
+# the reply has to come back carrying it.  Driven against the binary directly,
+# because the plugin itself only ever sends lines json_encode() produced.
+def MalformedRequestsAreAnswered()
+  var replies: list<string> = []
+  var job = job_start([REPO .. '/target/debug/simpleremote-daemon',
+    'agent', '--kind', 'ssh', '--target', TARGET,
+    '--agent', REPO .. '/bin/simpleremote-agent.sh', '--protocol', 'json'], {
+      in_io: 'pipe', out_io: 'pipe', err_io: 'pipe',
+      out_mode: 'nl', err_mode: 'nl',
+      out_cb: (_, line) => add(replies, line),
+    })
+  assert_equal('run', job_status(job), 'the bridge did not start')
+  var channel = job_getchannel(job)
+
+  # A valid request first, so a reply proves the bridge is up and talking.
+  ch_sendraw(channel, '{"id":16,"op":"ping"}' .. "\n")
+  assert_true(WaitFor(() => len(replies) >= 1), 'the bridge answered no ping')
+
+  # `content` typed wrong: serde refuses the request, the id is still readable.
+  ch_sendraw(channel,
+    '{"id":17,"op":"write","path":"/srv/x","content":["a"]}' .. "\n")
+  assert_true(WaitFor(() => len(replies) >= 2),
+    'a malformed request line was never answered: ' .. string(replies))
+  var answer = json_decode(replies[1])
+  assert_equal(17, answer.id, 'the reply did not carry the id from the line')
+  assert_false(answer.ok, 'a malformed request was answered with success')
+  assert_match('invalid request', answer.data)
+
+  # And the bridge is still serving after refusing that line.
+  ch_sendraw(channel, '{"id":18,"op":"ping"}' .. "\n")
+  assert_true(WaitFor(() => len(replies) >= 3),
+    'the bridge stopped serving after a malformed line')
+  assert_equal(18, json_decode(replies[2]).id)
+
+  job_stop(job, 'kill')
+  assert_true(WaitFor(() => job_status(job) !=# 'run'), 'the bridge did not exit')
+enddef
+
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
   assert_equal(1, get(capabilities, 'bridge_protocol', 0),
     'runtime does not advertise the bridge protocol')
   assert_true(index(get(capabilities, 'actions', []), 'upload') >= 0)
 
+  MalformedRequestsAreAnswered()
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
   ReadTimeoutIsReported()
   LargeFileWaitsForConfirmation()

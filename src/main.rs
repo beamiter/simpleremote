@@ -22,6 +22,60 @@
 mod bridge;
 mod transfer;
 
+/// Live heap bytes, so a test can assert that a reader handed a stream with no
+/// newline in it never actually retains the stream.  The containment being
+/// checked is a memory ceiling, and nothing else about the reader's behaviour
+/// changes when it is removed — an error message is still produced, and the
+/// next record is still served — so a test that watches only the message stays
+/// green while the daemon grows until the machine runs out of memory.
+#[cfg(test)]
+mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Counting;
+
+    // SAFETY: every method forwards to the system allocator with the same
+    // layout and pointer it was given; the counters are the only addition.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            unsafe { System.dealloc(pointer, layout) };
+        }
+    }
+
+    /// Start a measurement: returns the baseline the peak is measured against.
+    pub fn watch() -> usize {
+        let live = LIVE.load(Ordering::Relaxed);
+        PEAK.store(live, Ordering::Relaxed);
+        live
+    }
+
+    /// The largest the heap grew above `baseline` since `watch()`.  Tests run
+    /// in parallel, so this is an upper bound that includes other tests'
+    /// allocations — which is the safe direction for an assertion that the
+    /// growth stayed small.
+    pub fn peak_above(baseline: usize) -> usize {
+        PEAK.load(Ordering::Relaxed).saturating_sub(baseline)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static HEAP: heap::Counting = heap::Counting;
+
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -88,17 +142,21 @@ fn run() -> Result<u8, String> {
             println!("simpleremote-daemon {VERSION}");
             return Ok(0);
         }
+        "--help" | "-h" | "help" => {
+            println!("{}", usage());
+            return Ok(0);
+        }
+        "--self-test" | "self-test" => {
+            self_test()?;
+            println!("ok");
+            return Ok(0);
+        }
         "capabilities" => {
             println!("{}", capabilities());
             return Ok(0);
         }
         "agent" | "exec" | "probe" | "download" | "upload" => {}
-        _ => {
-            return Err(
-                "usage: simpleremote-daemon {agent|exec|probe|download|upload|capabilities} [options]"
-                    .to_string(),
-            );
-        }
+        _ => return Err(usage()),
     }
 
     let parsed = parse_args(args.collect())?;
@@ -136,6 +194,57 @@ fn run() -> Result<u8, String> {
     // grep must cancel its remote process too, not merely its local relay.
     let error = command.exec();
     Err(format!("cannot start {} transport: {error}", parsed.kind))
+}
+
+fn usage() -> String {
+    concat!(
+        "usage: simpleremote-daemon {agent|exec|probe|download|upload|capabilities} [options]\n",
+        "       simpleremote-daemon --version\n",
+        "       simpleremote-daemon --self-test\n\n",
+        "--self-test exercises the transport assembly and the JSON bridge in-process\n",
+        "and exits; an installer runs it before replacing a working daemon."
+    )
+    .to_string()
+}
+
+/// Prove that this binary works, not merely that it is not corrupt.
+///
+/// An installer has to decide whether to replace a daemon Vim is using, and a
+/// version string is printed just as happily by a half-linked build.  So run
+/// the paths every session depends on: the JSON bridge's encoders, the
+/// transport assembly for both kinds, and the private runtime directory that
+/// an ssh connection's control socket lives in — the check most likely to fail
+/// on a machine whose temporary directory is not what the daemon requires.
+fn self_test() -> Result<(), String> {
+    bridge::self_test()?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&capabilities())
+        .map_err(|error| format!("capabilities is not valid JSON: {error}"))?;
+    if parsed["bridge_protocol"] != serde_json::json!(BRIDGE_PROTOCOL) {
+        return Err("capabilities does not report the bridge protocol".to_string());
+    }
+
+    let agent = RuntimeArgs {
+        kind: "docker".into(),
+        target: "self-test".into(),
+        root: "/".into(),
+        agent: "~/.cache/vimrc/simpleremote-agent.sh".into(),
+        protocol: "json".into(),
+        ..RuntimeArgs::default()
+    };
+    validate(&agent, "agent")?;
+    let script = agent_bootstrap_script(&agent.agent, "#!/bin/sh\nexit 0\n")?;
+    if !script.contains(AGENT_HEREDOC) {
+        return Err("the agent bootstrap lost its heredoc".to_string());
+    }
+    transport_command(&agent, "agent")?;
+
+    let mut over_ssh = agent.clone();
+    over_ssh.kind = "ssh".into();
+    // Builds the per-user control socket path, which creates and re-checks the
+    // private runtime directory every ssh connection needs.
+    transport_command(&over_ssh, "agent")?;
+    Ok(())
 }
 
 /// One JSON object describing this build.  Vim runs `capabilities` once per
@@ -784,6 +893,15 @@ mod tests {
         let mut probe = args("ssh");
         probe.tty = true;
         assert!(validate(&probe, "probe").is_err());
+    }
+
+    /// An installer replaces a daemon Vim is using, so `--self-test` has to
+    /// exist and has to pass on a good build; without it the strongest check
+    /// the shared installer offers is unavailable to this plugin.
+    #[test]
+    fn the_self_test_covers_the_paths_an_installer_must_trust() {
+        self_test().unwrap();
+        assert!(usage().contains("--self-test"));
     }
 
     #[test]

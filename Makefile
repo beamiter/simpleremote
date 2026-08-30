@@ -1,4 +1,4 @@
-.PHONY: build install check workspace-sync virtual-tree runtime-exec transport-bridge integration-events suite-check
+.PHONY: build install check workspace-sync virtual-tree runtime-exec transport-bridge integration-events install-guard suite-check
 
 build:
 	cargo build --release --locked
@@ -16,6 +16,7 @@ check:
 	$(MAKE) runtime-exec
 	$(MAKE) transport-bridge
 	$(MAKE) integration-events
+	$(MAKE) install-guard
 
 workspace-sync:
 	PATH="$(CURDIR)/tests/fixtures:$$PATH" \
@@ -49,6 +50,15 @@ integration-events:
 	SIMPLEREMOTE_TEST_ROOT="$(CURDIR)" \
 	SIMPLEREMOTE_TEST_TARGET="fixture-target" \
 	vim -Nu NONE -n -i NONE -es -S tests/integration_events.vim
+
+# The installer replaces a daemon Vim is running, so what it refuses to install
+# is part of the gate.  The daemon's own --self-test runs first: install.sh
+# gates on it, and a daemon that cannot answer it turns the strongest check the
+# installer makes into one that always fails.
+install-guard:
+	cargo build --locked
+	target/debug/simpleremote-daemon --self-test
+	sh tests/install_guard.sh
 
 # Cross-plugin integration against the real siblings.  Deliberately outside
 # `check`: that gate has to pass in a checkout holding this plugin alone,
