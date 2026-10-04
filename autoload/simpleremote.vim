@@ -122,7 +122,7 @@ def Error(message: string)
 enddef
 
 def Emit(event: string, payload: dict<any> = {})
-  if event !~# '^[A-Za-z][A-Za-z0-9_]*$'
+  if event !~# '\m^[A-Za-z][A-Za-z0-9_]*$'
     return
   endif
   g:simpleremote_event = extend(copy(payload), {
@@ -1968,7 +1968,7 @@ def TreeIgnored(name: string): bool
     return false
   endif
   for pattern in ignore
-    if type(pattern) == v:t_string && name =~# glob2regpat(pattern)
+    if type(pattern) == v:t_string && name =~# ('\m' .. glob2regpat(pattern))
       return true
     endif
   endfor
@@ -4842,7 +4842,10 @@ def ParseDirectoryListing(remote_path: string, body: string,
       continue
     endif
     var name = ListingName(fields[0], encoded)
-    if empty(name) || !ValidRemoteRelative(name)
+    # Encoded listings preserve legal tabs/newlines inside a single basename.
+    # Interactive tree mutations have a stricter label policy, but that policy
+    # must not silently hide files from the public directory-listing API.
+    if empty(name) || name ==# '.' || name ==# '..' || stridx(name, '/') >= 0
       continue
     endif
     add(entries, {
