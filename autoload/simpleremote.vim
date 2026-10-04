@@ -26,6 +26,22 @@ const BRIDGE_PROTOCOL = 1
 g:vimrc_remote_status = 'disconnected'
 g:simpleremote_status = 'disconnected'
 
+def ConfigFlag(name: string, fallback: bool): bool
+  var value = get(g:, name, fallback)
+  if type(value) == v:t_bool
+    return value
+  endif
+  if type(value) == v:t_number
+    return value != 0
+  endif
+  return fallback
+enddef
+
+def ConfigInt(name: string, fallback: number, minimum: number = 0): number
+  var value = get(g:, name, fallback)
+  return type(value) == v:t_number ? max([minimum, value]) : fallback
+enddef
+
 def SetStatus(status: string)
   g:vimrc_remote_status = status
   g:simpleremote_status = status
@@ -106,6 +122,9 @@ def Error(message: string)
 enddef
 
 def Emit(event: string, payload: dict<any> = {})
+  if event !~# '^[A-Za-z][A-Za-z0-9_]*$'
+    return
+  endif
   g:simpleremote_event = extend(copy(payload), {
     event: event,
     status: get(g:, 'simpleremote_status', 'disconnected'),
@@ -190,8 +209,9 @@ def WireLine(id: number, op: string, args: dict<any>): string
 enddef
 
 def RequestTimeout(): number
-  return max([0, get(g:, 'simpleremote_request_timeout',
-    get(g:, 'vimrc_remote_request_timeout', 15000))])
+  var configured = get(g:, 'simpleremote_request_timeout',
+    get(g:, 'vimrc_remote_request_timeout', 15000))
+  return type(configured) == v:t_number ? max([0, configured]) : 15000
 enddef
 
 # `wants_lines` asks for the reply as buffer lines — Vim's binary
@@ -400,7 +420,7 @@ def AgentPath(): string
 enddef
 
 def DaemonPath(): string
-  if !get(g:, 'simpleremote_use_daemon', 1)
+  if !ConfigFlag('simpleremote_use_daemon', true)
     return ''
   endif
   var path = fnamemodify(expand(get(g:, 'simpleremote_daemon_path', '')), ':p')
@@ -664,7 +684,7 @@ def OpenTreeOnConnect(): bool
   if has_key(options, 'open_tree')
     return !!options.open_tree
   endif
-  return !!get(g:, 'simpleremote_open_tree_on_connect', 1)
+  return ConfigFlag('simpleremote_open_tree_on_connect', true)
 enddef
 
 def FinishConnection(generation: number)
@@ -900,8 +920,11 @@ def OpenRemote(path: string)
     return
   endif
 
-  var remote_path = path =~# '^/' ? path
-        : s_remote.root ==# '/' ? '/' .. path : s_remote.root .. '/' .. path
+  var remote_path = ResolveRemotePath(path)
+  if empty(remote_path)
+    Error('[SimpleRemote] remote path is outside the active workspace')
+    return
+  endif
   var uri = 'remote://' .. remote_path
   var existing = RemoteBufferFor(remote_path)
   var was_loaded = existing > 0 && bufloaded(existing)
@@ -926,7 +949,27 @@ def OpenRemote(path: string)
 enddef
 
 def JoinRemotePath(root: string, path: string): string
-  return root ==# '/' ? '/' .. path : root .. '/' .. path
+  if empty(path)
+    return root ==# '/' ? '/' : substitute(root, '/\+$', '', '')
+  endif
+  var prefix = root ==# '/' ? '' : substitute(root, '/\+$', '', '')
+  return prefix .. '/' .. path
+enddef
+
+# Collapse `.` / duplicate slashes and refuse a path that walks out of the
+# active workspace.  `simplify()` is the same walk Vim uses for local names;
+# without the UnderRoot gate, `../` in a relative open/read would land on
+# whatever the agent resolves after the workspace root.
+def ResolveRemotePath(path: string): string
+  if empty(s_remote) || empty(path)
+    return ''
+  endif
+  var remote = path =~# '^/' ? path : JoinRemotePath(s_remote.root, path)
+  remote = NormalizeTreeRoot(remote)
+  if empty(remote) || !UnderRoot(remote, s_remote.root)
+    return ''
+  endif
+  return remote
 enddef
 
 def ApplyRemoteRead(buf: number, generation: number, request_id: number,
@@ -994,7 +1037,7 @@ enddef
 # file crosses only once the user asks for it. 0 opens everything on sight,
 # the way it always did.
 def LargeFileLimit(): number
-  return max([0, get(g:, 'simpleremote_large_file_bytes', 10485760)])
+  return ConfigInt('simpleremote_large_file_bytes', 10485760)
 enddef
 
 def HumanBytes(size: number): string
@@ -1285,7 +1328,7 @@ def RemoteList(path: string)
         continue
       endif
       var name = ListingName(fields[0], !!get(info, 'encoded', false))
-      if empty(name)
+      if empty(name) || !ValidRemoteRelative(name)
         continue
       endif
       if fields[1] ==# 'd'
@@ -1644,7 +1687,7 @@ def RecordRecent()
     if other !=# key
       add(recent, spec)
     endif
-    if len(recent) >= get(g:, 'simpleremote_recent_limit', 12)
+    if len(recent) >= ConfigInt('simpleremote_recent_limit', 12, 1)
       break
     endif
   endfor
@@ -1675,7 +1718,8 @@ def NormalizeSpec(value: any, name: string = ''): dict<any>
   endif
   spec.kind = kind
   spec.target = target
-  spec.root = get(spec, 'root', '')
+  var root = get(spec, 'root', '')
+  spec.root = type(root) == v:t_string ? root : ''
   return spec
 enddef
 
@@ -1779,9 +1823,13 @@ enddef
 
 def ConnectSpec(spec: dict<any>)
   var root = get(spec, 'root', '')
+  var default_root = get(g:, 'simpleremote_default_root', '/')
+  if type(default_root) != v:t_string || default_root ==# ''
+    default_root = '/'
+  endif
   if empty(root)
     root = input(printf('%s %s folder: ', spec.kind, spec.target),
-      get(g:, 'simpleremote_default_root', '/'))
+      default_root)
   endif
   if empty(root)
     return
@@ -1890,7 +1938,7 @@ enddef
 def TreeWidth(): number
   var winid = get(s_tree, 'buf', -1)->bufwinid()
   return winid > 0 ? max([20, winwidth(winid) - 2])
-    : max([20, get(g:, 'simpleremote_tree_width', 40) - 2])
+    : max([20, ConfigInt('simpleremote_tree_width', 40, 1) - 2])
 enddef
 
 def TreeHeader(): list<string>
@@ -1915,7 +1963,11 @@ def TreeIgnored(name: string): bool
   if !get(g:, 'simpleremote_tree_show_hidden', 1) && name =~# '^\.'
     return true
   endif
-  for pattern in get(g:, 'simpleremote_tree_ignore', [])
+  var ignore = get(g:, 'simpleremote_tree_ignore', [])
+  if type(ignore) != v:t_list
+    return false
+  endif
+  for pattern in ignore
     if type(pattern) == v:t_string && name =~# glob2regpat(pattern)
       return true
     endif
@@ -1971,7 +2023,7 @@ def ParseTreeDirectory(path: string, body: string,
       continue
     endif
     var name = ListingName(fields[0], encoded)
-    if empty(name) || TreeIgnored(name)
+    if empty(name) || TreeIgnored(name) || !ValidRemoteRelative(name)
       continue
     endif
     var node = {
@@ -3801,7 +3853,7 @@ def OpenRemoteTree(path: string, reveal: string = '')
   if source_win == 0
     source_win = win_getid()
   endif
-  var width = max([24, get(g:, 'simpleremote_tree_width', 40)])
+  var width = max([24, ConfigInt('simpleremote_tree_width', 40, 1)])
   execute 'silent keepalt leftabove vnew ' .. fnameescape('[SimpleRemote]')
   execute 'vertical resize ' .. width
   var buf = bufnr()
@@ -4734,12 +4786,8 @@ def g:SimpleRemoteReadFile(path: string, Callback: func): number
     call(Callback, [false, 'remote workspace is not ready'])
     return -1
   endif
-  var remote_path = substitute(path, '^remote://', '', '')
-  if remote_path !~# '^/'
-    remote_path = JoinRemotePath(s_remote.root, remote_path)
-  endif
-  remote_path = NormalizeTreeRoot(remote_path)
-  if !UnderRoot(remote_path, s_remote.root)
+  var remote_path = ResolveRemotePath(substitute(path, '^remote://', '', ''))
+  if empty(remote_path)
     call(Callback, [false, 'remote path is outside the active workspace'])
     return -1
   endif
@@ -4794,7 +4842,7 @@ def ParseDirectoryListing(remote_path: string, body: string,
       continue
     endif
     var name = ListingName(fields[0], encoded)
-    if empty(name)
+    if empty(name) || !ValidRemoteRelative(name)
       continue
     endif
     add(entries, {

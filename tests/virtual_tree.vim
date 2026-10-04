@@ -30,6 +30,46 @@ g:simpleremote_tree_bookmarks_file = BOOKMARKS
 execute 'set runtimepath^=' .. fnameescape(REPO)
 runtime plugin/simpleremote.vim
 
+var sr_script = getscriptinfo({name: 'autoload/simpleremote.vim'})[0]
+var sr_sid = sr_script.sid
+def Sr(name: string, ...args: list<any>): any
+  return call(function(printf('<SNR>%d_%s', sr_sid, name)), args)
+enddef
+
+g:simpleremote_large_file_bytes = 'huge'
+assert_equal(10485760, Sr('LargeFileLimit'),
+  'a non-numeric large-file limit must not reach max()')
+g:simpleremote_large_file_bytes = -3
+assert_equal(0, Sr('LargeFileLimit'))
+unlet g:simpleremote_large_file_bytes
+
+g:simpleremote_request_timeout = v:true
+assert_equal(15000, Sr('RequestTimeout'),
+  'a boolean request timeout must not reach max()')
+unlet g:simpleremote_request_timeout
+
+g:simpleremote_tree_width = 'wide'
+assert_equal(38, Sr('TreeWidth'),
+  'a string tree width must not reach subtraction')
+unlet g:simpleremote_tree_width
+
+g:simpleremote_use_daemon = v:false
+assert_equal('', Sr('DaemonPath'),
+  'v:false must disable the runtime')
+g:simpleremote_use_daemon = 0
+g:simpleremote_daemon_path = REPO .. '/lib/simpleremote-daemon'
+
+g:simpleremote_profiles = [{name: 'bad-root', kind: 'ssh', target: 'host', root: ['/tmp']}]
+assert_equal('', get(g:SimpleRemoteProfiles()[0], 'root', 'MISSING'),
+  'a list root was stored on the spec')
+g:simpleremote_profiles = []
+
+g:simpleremote_tree_ignore = 'node_modules'
+assert_false(Sr('TreeIgnored', 'node_modules'),
+  'a string ignore list must not be walked as characters')
+g:simpleremote_tree_ignore = ['.git', '.hg', '.svn', '.venv', 'node_modules', '__pycache__',
+  '.mypy_cache', '.pytest_cache', '.ruff_cache']
+
 def TreeWin(): number
   for window in getwininfo()
     if getbufvar(window.bufnr, '&filetype') ==# 'simpleremotetree'
@@ -90,6 +130,11 @@ def Run()
   execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
   assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}),
     'root', '') ==# BASE), 'virtual workspace did not become ready')
+  assert_equal('', Sr('ResolveRemotePath', BASE .. '/../etc/passwd'),
+    'a .. walk was not rejected at the workspace boundary')
+  var listed = Sr('ParseDirectoryListing', BASE, "..\td\nalpha.txt\tf\n")
+  assert_equal(['alpha.txt'], mapnew(listed, (_, e) => e.name),
+    'directory listing accepted .. as a child name')
   g:SimpleRemoteTreeToggle()
   assert_true(WaitFor(() => PathLine(BASE .. '/alpha.txt') > 0),
     'virtual tree did not load its root')

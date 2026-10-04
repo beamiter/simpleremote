@@ -301,12 +301,23 @@ fn finish_record(
     Ok(bytes)
 }
 
+fn reject_agent_field(name: &str, value: &str) -> Result<(), String> {
+    if value
+        .bytes()
+        .any(|b| b == b'\n' || b == b'\r' || b == b'\t')
+    {
+        return Err(format!("{name} must not contain a line or field separator"));
+    }
+    Ok(())
+}
+
 /// The base64 payload for one request, mirroring what Vim's historical
 /// `Send()` produced.
 fn encode_payload(request: &Request) -> Result<String, String> {
     let raw: Vec<u8> = match request.op.as_str() {
         "ping" => Vec::new(),
         "read" | "read-config" | "list" | "list-meta" | "list-encoded" | "list-meta-encoded" => {
+            reject_agent_field("path", &request.path)?;
             request.path.as_bytes().to_vec()
         }
         "exec" | "grep" => request.command.as_bytes().to_vec(),
@@ -314,6 +325,7 @@ fn encode_payload(request: &Request) -> Result<String, String> {
             if request.path.is_empty() {
                 return Err("write requires a path".to_string());
             }
+            reject_agent_field("path", &request.path)?;
             let inner = match (&request.content_b64, &request.content) {
                 (Some(encoded), _) => {
                     // Validate now so a corrupt payload fails here, with a
@@ -580,6 +592,17 @@ mod tests {
                 r#"{"id":1,"op":"write","path":"/f","content_b64":"%%%"}"#
             ))
             .is_err()
+        );
+        assert!(
+            encode_payload(&request(r#"{"id":1,"op":"read","path":"/f\nlist\t/"}"#)).is_err(),
+            "a newline in path would split the agent record"
+        );
+        assert!(
+            encode_payload(&request(
+                r#"{"id":1,"op":"write","path":"/f\t/etc/passwd","content":"x"}"#
+            ))
+            .is_err(),
+            "a tab in path would split the agent's write record"
         );
     }
 
