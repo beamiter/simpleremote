@@ -4,6 +4,7 @@ vim9script
 # Vim-specific: it is a small shell agent speaking a line protocol.
 var s_remote: dict<any> = {}
 var s_next_id = 0
+var s_write_serial = 0
 var s_generation = 0
 var s_base64_decode_flag = ''
 var s_connect_spec: dict<any> = {}
@@ -992,6 +993,12 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     return
   endif
 
+  var write = getbufvar(buf, 'vimrc_remote_write_state', {})
+  if type(write) == v:t_dict && get(write, 'status', '') ==# 'pending'
+    Error('[VimrcRemote] read result ignored while a remote write is pending')
+    return
+  endif
+
   # A trailing empty item is how both readfile(..., 'b') and RemoteLines()
   # report a final newline; the buffer records it as 'endofline' instead.
   var lines = copy(body)
@@ -1015,6 +1022,10 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     generation: generation,
   })
   setbufvar(buf, '&modified', 0)
+  # A fresh successful read is a new disk snapshot. Completed write ACKs refer
+  # to the old changedtick/EOL and must not block a later clean save/build.
+  setbufvar(buf, 'vimrc_remote_write_state', {})
+  setbufvar(buf, 'vimrc_remote_writepost_pending', {})
   DetectRemoteFiletype(buf)
   # `type` and `bufnr` are the documented payload (SimpleEditorConfig keys on
   # them); Emit adds event/status/time like every other SimpleRemote event.
@@ -1170,6 +1181,11 @@ def FinishSizeProbe(buf: number, generation: number, request_id: number,
 enddef
 
 def ReadRemote(uri: string)
+  var write = get(b:, 'vimrc_remote_write_state', {})
+  if type(write) == v:t_dict && get(write, 'status', '') ==# 'pending'
+    Error('[VimrcRemote] wait for the pending remote write before rereading')
+    return
+  endif
   if empty(s_remote)
     # A session file re-edits remote:// buffers before the workspace exists;
     # the session restore reconnects and re-reads them, so stay quiet then.
@@ -1219,61 +1235,126 @@ def FireRemoteWritePost(buf: number, generation: number, tick: number,
   endif
 enddef
 
-def FinishRemoteWrite(buf: number, generation: number, tick: number,
+# Each buffer write has a durable ACK identity. 'modified' alone is not an
+# acknowledgement: a clean explicit :write starts clean, and undo can return
+# a pending write's buffer to its previous saved state before the reply arrives.
+def FinishRemoteWrite(buf: number, generation: number, serial: number, tick: number,
     final_eol: bool, ok: bool, body: string)
-  if !IsCurrent(generation) || !bufexists(buf)
+  if !bufexists(buf)
+    return
+  endif
+  var state = getbufvar(buf, 'vimrc_remote_write_state', {})
+  if get(state, 'serial', -1) != serial
+    return
+  endif
+  var info = getbufvar(buf, 'vimrc_remote', {})
+  if !IsCurrent(generation) || get(info, 'generation', -1) != generation
+      || get(info, 'path', '') != get(state, 'path', '')
+    state.status = 'error'
+    state.message = 'remote connection or file identity changed during write'
+    setbufvar(buf, 'vimrc_remote_write_state', state)
+    setbufvar(buf, '&modified', 1)
     return
   endif
   if !ok
+    state.status = 'error'
+    state.message = body
+    setbufvar(buf, 'vimrc_remote_write_state', state)
+    setbufvar(buf, '&modified', 1)
     Error('[VimrcRemote] save failed: ' .. body)
     return
   endif
-  var same_tick = getbufvar(buf, 'changedtick', -1) == tick
-  if same_tick && BufferHasFinalEol(buf) == final_eol
+  if getbufvar(buf, 'changedtick', -1) == tick && BufferHasFinalEol(buf) == final_eol
+    state.status = 'success'
+    state.message = ''
+    setbufvar(buf, 'vimrc_remote_write_state', state)
     setbufvar(buf, '&modified', 0)
     FireRemoteWritePost(buf, generation, tick, final_eol)
-  else
-    # 'endofline'/'fixendofline' can change without advancing changedtick.
-    # Mark that byte-level difference pending just like a text edit.
-    if same_tick
+    # WritePost can edit/undo or start a newer save. Never overwrite its newer
+    # serial; edits after our ACK still differ from the acknowledged snapshot.
+    var latest = getbufvar(buf, 'vimrc_remote_write_state', {})
+    if get(latest, 'serial', -1) == serial
+        && (getbufvar(buf, 'changedtick', -1) != tick || BufferHasFinalEol(buf) != final_eol)
+      latest.status = 'stale'
+      latest.message = 'buffer changed during write completion hooks'
+      setbufvar(buf, 'vimrc_remote_write_state', latest)
       setbufvar(buf, '&modified', 1)
     endif
-    echomsg '[VimrcRemote] saved an older snapshot; newer changes remain'
+  else
+    state.status = 'stale'
+    state.message = 'saved an older snapshot; newer changes remain'
+    setbufvar(buf, 'vimrc_remote_write_state', state)
+    # Undo may have reset 'modified' even though the remote disk now contains
+    # the in-flight snapshot. Always mark this divergence explicitly.
+    setbufvar(buf, '&modified', 1)
+    echomsg '[VimrcRemote] ' .. state.message
   endif
   echomsg '[VimrcRemote] saved ' .. body
 enddef
 
 def WriteRemote(buf: number = bufnr())
-  if empty(s_remote)
-    Error('[VimrcRemote] not connected')
+  if !bufexists(buf)
     return
   endif
-  var deferred = getbufvar(buf, 'vimrc_remote_deferred', {})
-  if type(deferred) == v:t_dict && !empty(deferred)
-    Error('[VimrcRemote] ' .. get(deferred, 'path', '')
-      .. ' has not been read yet; :SimpleRemoteLoad first')
-    return
-  endif
-  var info = getbufvar(buf, 'vimrc_remote', {})
-  if empty(info)
-    Error('[VimrcRemote] buffer is not backed by a remote file')
-    return
-  endif
-  var generation = s_remote.generation
-  if get(info, 'generation', -1) != generation
-    Error('[VimrcRemote] buffer belongs to an old connection; reopen it first')
-    return
-  endif
-  # BufWriteCmd suppresses Vim's own BufWritePre; fire it so trailing
-  # whitespace trimming, format-on-save and friends see remote saves too.
-  if buf == bufnr()
-    silent doautocmd <nomodeline> BufWritePre
-  endif
-  var tick = getbufvar(buf, 'changedtick', -1)
-  var final_eol = BufferHasFinalEol(buf)
-  var encoded = EncodeLinesToBase64(getbufline(buf, 1, '$'), final_eol)
-  Send('write', {path: info.path, content_b64: encoded}, (ok, body) =>
-    FinishRemoteWrite(buf, generation, tick, final_eol, ok, body))
+  s_write_serial += 1
+  var serial = s_write_serial
+  var state = {serial: serial, generation: get(s_remote, 'generation', -1),
+    tick: getbufvar(buf, 'changedtick', -1), final_eol: BufferHasFinalEol(buf),
+    status: 'pending', message: '', path: ''}
+  setbufvar(buf, 'vimrc_remote_write_state', state)
+  setbufvar(buf, 'vimrc_remote_writepost_pending', {})
+  try
+    if empty(s_remote)
+      throw 'not connected'
+    endif
+    if !empty(getbufvar(buf, 'vimrc_remote_read', {}))
+      throw 'remote read is still pending; wait before writing'
+    endif
+    var deferred = getbufvar(buf, 'vimrc_remote_deferred', {})
+    if type(deferred) == v:t_dict && !empty(deferred)
+      throw get(deferred, 'path', '') .. ' has not been read yet; :SimpleRemoteLoad first'
+    endif
+    var info = getbufvar(buf, 'vimrc_remote', {})
+    if empty(info)
+      throw 'buffer is not backed by a remote file'
+    endif
+    var generation = s_remote.generation
+    if get(info, 'generation', -1) != generation
+      throw 'buffer belongs to an old connection; reopen it first'
+    endif
+    # BufWriteCmd suppresses Vim's own BufWritePre; preserve normal hooks.
+    if buf == bufnr()
+      silent doautocmd <nomodeline> BufWritePre
+    endif
+    if get(getbufvar(buf, 'vimrc_remote_write_state', {}), 'serial', -1) != serial
+      return
+    endif
+    if !IsCurrent(generation) || get(getbufvar(buf, 'vimrc_remote', {}), 'path', '') != info.path
+      throw 'remote connection or file changed during BufWritePre'
+    endif
+    var tick = getbufvar(buf, 'changedtick', -1)
+    var final_eol = BufferHasFinalEol(buf)
+    state.tick = tick
+    state.final_eol = final_eol
+    state.path = info.path
+    setbufvar(buf, 'vimrc_remote_write_state', state)
+    var encoded = EncodeLinesToBase64(getbufline(buf, 1, '$'), final_eol)
+    Send('write', {path: info.path, content_b64: encoded}, (ok, body) =>
+      FinishRemoteWrite(buf, generation, serial, tick, final_eol, ok, body))
+  catch
+    if get(getbufvar(buf, 'vimrc_remote_write_state', {}), 'serial', -1) == serial
+      state.status = 'error'
+      state.message = v:exception
+      setbufvar(buf, 'vimrc_remote_write_state', state)
+    endif
+    Error('[VimrcRemote] save failed: ' .. v:exception)
+  endtry
+enddef
+
+# Read-only provider contract for save-before-build callers. Never infer ACK
+# success from buffer flags, and retain serial/generation with each request.
+def g:SimpleRemoteWriteState(buffer: number = 0): dict<any>
+  return deepcopy(getbufvar(buffer > 0 ? buffer : bufnr(), 'vimrc_remote_write_state', {}))
 enddef
 
 def RemoteExec(command: string)
@@ -3105,14 +3186,36 @@ def RemoteTreeRename()
   endif
   var source = node.path
   var target = JoinRemotePath(RemoteParent(source), name)
+  if !empty(ModifiedRemoteBufferUnder(source))
+    Error('[SimpleRemote] save modified remote source buffers and wait for pending writes before renaming')
+    return
+  endif
+  var generation = s_remote.generation
+  if !empty(globpath(&runtimepath, 'autoload/simplecc/files.vim'))
+    simplecc#files#Begin('remote://' .. source, 'remote://' .. target,
+      node.type ==# 'd', () => CompleteRemoteTreeRename(source, target, generation))
+    return
+  endif
+  CompleteRemoteTreeRename(source, target, generation)
+enddef
+
+# Synchronous completion boundary for the LSP transaction. The agent's reply
+# decides success; imports are never changed before a successful move reply.
+def CompleteRemoteTreeRename(source: string, target: string, generation: number): bool
+  if !IsCurrent(generation) || !empty(ModifiedRemoteBufferUnder(source))
+    Error('[SimpleRemote] connection changed or source modified/pending write; rename canceled')
+    return false
+  endif
+  var result: dict<any> = {done: false, ok: false}
   var quoted_target = shellescape(target)
   var command = 'if [ -e ' .. quoted_target .. ' ] || [ -L '
     .. quoted_target .. ' ]; then printf "already exists: %s\\n" '
     .. quoted_target .. ' >&2; exit 47; fi; mv ' .. shellescape(source)
     .. ' ' .. quoted_target
-  var generation = s_remote.generation
   Send('exec', {command: command}, (ok, body) => {
-    if ok && IsCurrent(generation)
+    result.done = true
+    result.ok = ok && IsCurrent(generation)
+    if result.ok
       RetargetRemoteBuffers(source, target)
       RewriteRemoteTreeMaps(source, target)
       AnnounceFilesChanged([{path: source, type: 'deleted'},
@@ -3120,6 +3223,15 @@ def RemoteTreeRename()
     endif
     RemoteTreeMutationFinished(generation, 'renamed', target, false, ok, body)
   })
+  var start = reltime()
+  while !result.done && IsCurrent(generation) && reltimefloat(reltime(start)) < 15.0
+    sleep 10m
+  endwhile
+  if !result.done
+    Error('[SimpleRemote] rename outcome unknown after timeout/disconnect; refresh the tree before retrying; imports were not changed')
+  endif
+  return result.done && result.ok
+
 enddef
 
 def RemoteTreeActionNodes(): list<dict<any>>
@@ -3225,6 +3337,12 @@ def RemoteTreePaste()
   endif
   var destination = RemoteTreeTargetDirectory()
   var mode = get(s_tree_clipboard, 'mode', 'copy')
+  for item in get(s_tree_clipboard, 'items', [])
+    if mode ==# 'cut' && !empty(ModifiedRemoteBufferUnder(item.path))
+      Error('[SimpleRemote] save modified remote source buffers and wait for pending writes before moving')
+      return
+    endif
+  endfor
   var checks: list<string> = []
   var operations: list<string> = []
   for item in get(s_tree_clipboard, 'items', [])
@@ -3242,6 +3360,10 @@ def RemoteTreePaste()
       .. shellescape(source) .. ' ' .. quoted_target)
   endfor
   var generation = s_remote.generation
+  if mode ==# 'cut' && !empty(globpath(&runtimepath, 'autoload/simplecc/files.vim'))
+    IntegratedRemotePaste(copy(get(s_tree_clipboard, 'items', [])), destination, generation)
+    return
+  endif
   Send('exec', {command: join(['set -e'] + checks + operations, '; ')}, (ok, body) => {
     if ok && IsCurrent(generation)
       var changes: list<dict<any>> = []
@@ -3265,9 +3387,43 @@ def RemoteTreePaste()
   })
 enddef
 
+def IntegratedRemotePaste(items: list<dict<any>>, destination: string, generation: number)
+  if empty(items) || !IsCurrent(generation)
+    return
+  endif
+  var item = items[0]
+  var target = JoinRemotePath(destination, fnamemodify(item.path, ':t'))
+  if item.type ==# 'd' && UnderRoot(target, item.path)
+    Error('[SimpleRemote] cannot move a directory into itself')
+    return
+  endif
+  simplecc#files#Begin('remote://' .. item.path, 'remote://' .. target,
+    item.type ==# 'd', () => CompleteRemotePasteItem(items, destination, generation, target))
+enddef
+
+def CompleteRemotePasteItem(items: list<dict<any>>, destination: string,
+    generation: number, target: string): bool
+  if !CompleteRemoteTreeRename(items[0].path, target, generation)
+    return false
+  endif
+  var remaining = items[1 :]
+  if empty(remaining)
+    s_tree_clipboard = {}
+    s_tree.marked = {}
+  else
+    s_tree_clipboard.items = remaining
+    timer_start(0, (_) => IntegratedRemotePaste(remaining, destination, generation))
+  endif
+  return true
+enddef
+
 def ModifiedRemoteBufferUnder(root: string): string
   for info in getbufinfo()
-    if !get(info, 'changed', 0)
+    var write = getbufvar(info.bufnr, 'vimrc_remote_write_state', {})
+    var pending_write = type(write) == v:t_dict && get(write, 'status', '') ==# 'pending'
+    # A clean explicit write is still using the old path until its ACK. Moving
+    # that path now could let the in-flight write recreate it after the rename.
+    if !get(info, 'changed', 0) && !pending_write
       continue
     endif
     var remote = getbufvar(info.bufnr, 'vimrc_remote', {})
@@ -4794,6 +4950,21 @@ def g:SimpleRemoteReadFile(path: string, Callback: func): number
   return Send('read', {path: remote_path}, (ok, body) => {
     call(Callback, [ok, body])
   })
+enddef
+
+# Binary-safe text-line read for transactional refactor previews. The final
+# empty item preserves end-of-line just like readfile(path, 'b').
+def g:SimpleRemoteReadFileLines(path: string, Callback: func): number
+  if !IsReady()
+    call(Callback, [false, ['remote workspace is not ready']])
+    return -1
+  endif
+  var remote_path = ResolveRemotePath(substitute(path, '^remote://', '', ''))
+  if empty(remote_path)
+    call(Callback, [false, ['remote path is outside the active workspace']])
+    return -1
+  endif
+  return Send('read', {path: remote_path}, Callback, true)
 enddef
 
 # Run a shell command in the workspace root over the persistent agent

@@ -93,9 +93,11 @@ def Exercise(protocol: string, agent: string)
     protocol .. ': remote buffer did not load')
   setline(2, 'edited ✓ é')
   write
+  assert_equal('pending', g:SimpleRemoteWriteState().status, protocol .. ': write must await its ACK')
   assert_true(WaitFor(() => readfile(BASE .. '/utf8.txt') ==# ['plain', 'edited ✓ é']),
     protocol .. ': remote write did not land')
   assert_true(WaitFor(() => !&modified), protocol .. ': buffer stayed modified')
+  assert_equal('success', g:SimpleRemoteWriteState().status, protocol .. ': write ACK was not recorded')
 
   # Public helpers over the persistent agent connection.
   done = false

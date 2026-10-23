@@ -126,6 +126,135 @@ def MetadataReady(): bool
   return lnum > 0 && get(TreeNodes()[lnum - 1], 'size', -1) >= 0
 enddef
 
+# Genuine agent replies, delayed behind a queued command, prove that buffer
+# cleanliness is not a write acknowledgement and old serials cannot clear it.
+def WriteAckCases()
+  var buffer = bufnr()
+  var generation = g:simpleremote_workspace.id
+  g:write_ack_posts = 0
+  augroup WriteAckFixture
+    autocmd!
+    autocmd BufWritePost remote://* g:write_ack_posts += 1
+  augroup END
+  # :write on an already clean buffer still has to wait for its real ACK.
+  g:SimpleRemoteExecute('sleep 0.15', (_, _) => 0)
+  write
+  var clean = g:SimpleRemoteWriteState(buffer)
+  assert_equal('pending', clean.status, 'clean explicit write waits for an ACK')
+  assert_false(&modified)
+  assert_false(Sr('CompleteRemoteTreeRename', BASE .. '/dest/nested.txt',
+    BASE .. '/dest/should-not-rename-pending.txt', generation),
+    'clean pending writes block the actual remote rename mutation')
+  assert_true(filereadable(BASE .. '/dest/nested.txt'))
+  assert_false(filereadable(BASE .. '/dest/should-not-rename-pending.txt'))
+  Sr('ReadRemote', 'remote://' .. BASE .. '/dest/nested.txt')
+  assert_equal({}, get(b:, 'vimrc_remote_read', {}), 'a pending write refuses a new read')
+  assert_equal('pending', g:SimpleRemoteWriteState(buffer).status, 'read refusal cannot complete a pending write')
+  clean.status = 'fake mutation'
+  assert_equal('pending', g:SimpleRemoteWriteState(buffer).status, 'WriteState returns a read-only copy')
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+  assert_equal(b:changedtick, g:SimpleRemoteWriteState(buffer).tick)
+  assert_equal(1, g:write_ack_posts, 'successful clean write still emits BufWritePost')
+
+  # Undo can make a pending buffer nominally clean while the remote is about
+  # to install the request's newer snapshot. The ACK must mark it stale/dirty.
+  setline(1, 'snapshot before undo')
+  g:SimpleRemoteExecute('sleep 0.15', (_, _) => 0)
+  write
+  normal! u
+  assert_false(&modified, 'fixture undo returns to the previous saved contents')
+  assert_equal('pending', g:SimpleRemoteWriteState(buffer).status)
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'stale'))
+  assert_true(&modified, 'stale ACK restores modified even when undo cleared it')
+  assert_equal(1, g:write_ack_posts, 'stale ACK must not emit BufWritePost')
+  assert_equal(['snapshot before undo'], readfile(BASE .. '/dest/nested.txt'))
+  setline(1, 'nested')
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+
+  # EOL flags are byte changes without changedtick; they also cannot certify
+  # success for the snapshot currently being written.
+  g:SimpleRemoteExecute('sleep 0.15', (_, _) => 0)
+  write
+  var eol_tick = b:changedtick
+  setlocal noendofline nofixendofline nomodified
+  assert_equal(eol_tick, b:changedtick)
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'stale'))
+  assert_true(&modified)
+  setlocal endofline fixendofline
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+
+  # Two in-flight writes: a prior reply must not replace the newer pending
+  # serial or mark the latest buffer clean. Exercise the same callback directly
+  # before the genuine queued agent replies arrive.
+  g:SimpleRemoteExecute('sleep 0.15', (_, _) => 0)
+  setline(1, 'first queued snapshot')
+  write
+  var first = g:SimpleRemoteWriteState(buffer)
+  setline(1, 'second queued snapshot')
+  write
+  var latest = g:SimpleRemoteWriteState(buffer)
+  assert_true(latest.serial > first.serial)
+  Sr('FinishRemoteWrite', buffer, generation, first.serial, first.tick, first.final_eol, true, 'old reply')
+  assert_equal(latest, g:SimpleRemoteWriteState(buffer), 'old ACK leaves newer pending identity untouched')
+  assert_true(&modified)
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+  assert_equal(latest.serial, g:SimpleRemoteWriteState(buffer).serial)
+  assert_equal(['second queued snapshot'], readfile(BASE .. '/dest/nested.txt'))
+  assert_equal(4, g:write_ack_posts, 'superseded ACK does not emit a second BufWritePost')
+
+  # Agent refusal is observable to a caller even if its own write command did
+  # not throw. Use a symlink, which the installed agent refuses to replace.
+  delete(BASE .. '/dest/nested.txt')
+  system('ln -s ' .. shellescape(BASE .. '/alpha.txt') .. ' ' .. shellescape(BASE .. '/dest/nested.txt'))
+  setline(1, 'rejected symlink write')
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'error'))
+  assert_true(&modified)
+  assert_match('symbolic link', g:SimpleRemoteWriteState(buffer).message)
+  assert_equal(4, g:write_ack_posts, 'failed ACK does not emit BufWritePost')
+  delete(BASE .. '/dest/nested.txt')
+  writefile(['nested'], BASE .. '/dest/nested.txt')
+  setline(1, 'nested')
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+
+  # A completed ACK belongs to its old snapshot. A successful refresh clears
+  # it so a later clean SaveWait cannot mistake the reread's tick for old bytes.
+  assert_equal('success', g:SimpleRemoteWriteState(buffer).status)
+  Sr('ReadRemote', 'remote://' .. BASE .. '/dest/nested.txt')
+  assert_true(WaitFor(() => empty(get(b:, 'vimrc_remote_read', {}))
+    && empty(g:SimpleRemoteWriteState(buffer))))
+  assert_false(&modified)
+  if exists('*g:VimrcSaveWait')
+    assert_equal('success', g:VimrcSaveWait(500).status, 'write then reread then clean save/build is valid')
+  endif
+
+  # Disconnect fails pending writes immediately. A late callback from that
+  # generation must never turn this failed request into a successful save.
+  g:SimpleRemoteExecute('sleep 0.2', (_, _) => 0)
+  setline(1, 'snapshot interrupted by disconnect')
+  write
+  var interrupted = g:SimpleRemoteWriteState(buffer)
+  SimpleRemoteDisconnect
+  assert_equal('error', g:SimpleRemoteWriteState(buffer).status)
+  assert_true(&modified)
+  Sr('FinishRemoteWrite', buffer, generation, interrupted.serial, interrupted.tick, interrupted.final_eol, true, 'late disconnected reply')
+  assert_equal('error', g:SimpleRemoteWriteState(buffer).status, 'disconnected generation cannot report success')
+  assert_equal(5, g:write_ack_posts)
+  augroup WriteAckFixture
+    autocmd!
+  augroup END
+  setlocal nomodified
+  execute 'bwipeout! ' .. buffer
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}), 'root', '') ==# BASE))
+  g:VimrcRemoteOpen(BASE .. '/dest/nested.txt')
+  assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'generation', -1)
+    == get(get(g:, 'simpleremote_workspace', {}), 'id', -2)))
+enddef
+
 def Run()
   execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
   assert_true(WaitFor(() => get(get(g:, 'simpleremote_workspace', {}),
@@ -146,6 +275,7 @@ def Run()
   g:VimrcRemoteOpen(BASE .. '/dest/nested.txt')
   assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '')
     ==# BASE .. '/dest/nested.txt'), 'nested remote buffer did not load')
+  WriteAckCases()
   g:SimpleRemoteTreeToggle()
   assert_true(WaitFor(() => PathLine(BASE .. '/dest/nested.txt') > 0),
     'virtual tree did not load the active file parent')
