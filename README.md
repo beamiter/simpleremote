@@ -71,7 +71,8 @@ what; the short list:
 
 - `g:SimpleRemoteShellCommand(script)` / `g:SimpleRemoteExecArgv()` — run a
   shell script or an argv in the workspace root through the runtime.
-- `g:SimpleRemoteExecute(cmd, Cb)`, `g:SimpleRemoteReadFile(path, Cb)`,
+- `g:SimpleRemoteExecute(cmd, Cb [, timeout_ms])`, `g:SimpleRemoteCancel(id)`,
+  `g:SimpleRemoteReadFile(path, Cb)`,
   `g:SimpleRemoteWriteFile(path, content, Cb)`,
   `g:SimpleRemoteListDirectory(path, Cb)` — asynchronous remote filesystem
   operations over the persistent connection.

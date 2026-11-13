@@ -211,15 +211,18 @@ enddef
 # message aborted the timeout timer with E1013 and hid the timeout itself.
 # Nothing here is protocol specific, so one transport proves it.
 def ReadTimeoutIsReported()
+  # Inject delay into the read operation itself: user commands now run on an
+  # isolated transport and must no longer hold up the agent's file requests.
+  var prior_agent = g:simpleremote_agent
+  var slow_agent = BASE .. '/slow-agent.sh'
+  var source = readfile(REPO .. '/bin/simpleremote-agent.sh')
+  insert(source, '      sleep 2', index(source, '    read)') + 1)
+  writefile(source, slow_agent)
+  g:simpleremote_agent_source = slow_agent
+  g:simpleremote_agent = AGENT_DIR .. '/slow/simpleremote-agent.sh'
   execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
   assert_true(WaitFor(Ready), 'timeout: workspace did not become ready')
 
-  # The agent answers one request per line, in order, so this sleep keeps the
-  # read behind it queued well past the timeout below.
-  var slept = false
-  g:SimpleRemoteExecute('sleep 2', (ok, text) => {
-    slept = true
-  })
   g:simpleremote_request_timeout = 200
   messages clear
   g:VimrcRemoteOpen(BASE .. '/utf8.txt')
@@ -229,7 +232,9 @@ def ReadTimeoutIsReported()
     'timed-out read aborted with a type error: ' .. execute('messages'))
 
   unlet g:simpleremote_request_timeout
-  assert_true(WaitFor(() => slept), 'the blocking command never finished')
+  sleep 2200m
+  unlet g:simpleremote_agent_source
+  g:simpleremote_agent = prior_agent
   silent! bwipeout!
   SimpleRemoteDisconnect
   assert_true(WaitFor(() => get(g:, 'simpleremote_status', '') ==# 'disconnected'))

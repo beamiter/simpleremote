@@ -14,6 +14,7 @@ check:
 	$(MAKE) workspace-sync
 	$(MAKE) virtual-tree
 	$(MAKE) runtime-exec
+	$(MAKE) command-lifecycle
 	$(MAKE) transport-bridge
 	$(MAKE) integration-events
 	$(MAKE) install-guard
@@ -70,3 +71,11 @@ suite-check:
 	SIMPLEREMOTE_TEST_ROOT="$(CURDIR)" \
 	SIMPLEREMOTE_TEST_TARGET="fixture-target" \
 	vim -Nu NONE -n -i NONE -es -S tests/suite_integration.vim
+
+.PHONY: command-lifecycle
+command-lifecycle:
+	cargo build --locked
+	PATH="$(CURDIR)/tests/fixtures:$$PATH" \
+	SIMPLEREMOTE_TEST_ROOT="$(CURDIR)" \
+	SIMPLEREMOTE_TEST_TARGET="fixture-target" \
+	vim -Nu NONE -n -i NONE -es -S tests/command_lifecycle.vim

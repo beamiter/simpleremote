@@ -4,6 +4,7 @@ vim9script
 # Vim-specific: it is a small shell agent speaking a line protocol.
 var s_remote: dict<any> = {}
 var s_next_id = 0
+var s_exec: dict<any> = {}
 var s_write_serial = 0
 var s_generation = 0
 var s_base64_decode_flag = ''
@@ -395,6 +396,12 @@ def OnError(generation: number, _channel: any, line: string)
 enddef
 
 def FailPending(remote: dict<any>, message: string)
+  for key in keys(s_exec)
+    if has_key(s_exec, key)
+        && get(s_exec[key], 'generation', -1) == get(remote, 'generation', -2)
+      StopExec(key, message .. '; remote command outcome is unknown')
+    endif
+  endfor
   for entry in values(get(remote, 'pending', {}))
     StopRequestTimer(entry)
     FailRequest(entry.callback, get(entry, 'wants_lines', false), message)
@@ -1362,8 +1369,7 @@ def RemoteExec(command: string)
     Error('[VimrcRemote] not connected')
     return
   endif
-  var root = s_remote.root
-  Send('exec', {command: 'cd ' .. shellescape(root) .. ' && ' .. command},
+  g:SimpleRemoteExecute(command,
     (ok, body) => {
       if ok
         echomsg body
@@ -1377,7 +1383,7 @@ def RemoteFind(query: string)
   var root = s_remote.root
   var command = 'rg --files --hidden --glob ' .. shellescape('!.git/*')
         .. ' | rg --smart-case -- ' .. shellescape(query)
-  Send('grep', {command: 'cd ' .. shellescape(root) .. ' && ' .. command},
+  g:SimpleRemoteExecute(command,
     (ok, body) => {
       if !ok && !empty(body)
         Error('[VimrcRemote] ' .. body)
@@ -1441,8 +1447,7 @@ def RemoteHealth()
 enddef
 
 def RemoteGit(command: string)
-  var root = s_remote.root
-  Send('exec', {command: 'cd ' .. shellescape(root) .. ' && git ' .. command},
+  g:SimpleRemoteExecute('git ' .. command,
     (ok, body) => {
       if !ok
         Error('[VimrcRemote] ' .. body)
@@ -4967,18 +4972,111 @@ def g:SimpleRemoteReadFileLines(path: string, Callback: func): number
   return Send('read', {path: remote_path}, Callback, true)
 enddef
 
-# Run a shell command in the workspace root over the persistent agent
-# connection and deliver its combined output.  Callback is (ok, output).
-# Cheaper than job_start(g:SimpleRemoteShellCommand()) for short commands
-# because no new transport session is opened; use the latter for streaming
-# or long-running processes.
-def g:SimpleRemoteExecute(command: string, Callback: func): number
+# Interactive commands use a separate transport: a slow search/build must not
+# hold up file RPCs. Internal transactional operations still use the agent.
+# Removing the entry before stopping/callbacks makes all completion races and
+# reentrant callbacks exactly-once. Stopping a transport is not remote rollback.
+def StopExec(key: string, message: string): bool
+  if !has_key(s_exec, key)
+    return false
+  endif
+  var entry = remove(s_exec, key)
+  StopRequestTimer(entry)
+  if has_key(entry, 'job')
+    if job_status(entry.job) ==# 'run'
+      job_stop(entry.job, 'kill')
+    endif
+    var channel = job_getchannel(entry.job)
+    if ch_status(channel) ==# 'open'
+      ch_close(channel)
+    endif
+  endif
+  call(entry.callback, [false, message])
+  return true
+enddef
+
+def ExecOutput(key: string, text: string)
+  if !has_key(s_exec, key)
+    return
+  endif
+  if strlen(s_exec[key].output) + strlen(text) > 8 * 1024 * 1024
+    StopExec(key, 'command output limit exceeded; remote command outcome is unknown')
+    return
+  endif
+  s_exec[key].output ..= text
+enddef
+
+def ExecFinished(key: string)
+  if !has_key(s_exec, key) || !s_exec[key].closed || !s_exec[key].exited
+    return
+  endif
+  var entry = remove(s_exec, key)
+  StopRequestTimer(entry)
+  call(entry.callback, [entry.status == 0, entry.output])
+enddef
+
+def ExecClosed(key: string)
+  if has_key(s_exec, key)
+    s_exec[key].closed = true
+    ExecFinished(key)
+  endif
+enddef
+
+def ExecExited(key: string, status: number)
+  if has_key(s_exec, key)
+    s_exec[key].status = status
+    s_exec[key].exited = true
+    ExecFinished(key)
+  endif
+enddef
+
+# Callback is (ok, combined output-or-error). timeout_ms defaults to the RPC
+# timeout; zero disables the local deadline. No command is queued when busy.
+def g:SimpleRemoteExecute(command: string, Callback: func,
+    timeout_ms: number = -1): number
   if !IsReady()
     call(Callback, [false, 'remote workspace is not ready'])
     return -1
   endif
-  return Send('exec', {command: 'cd ' .. shellescape(s_remote.root)
-    .. ' && ' .. command}, Callback)
+  if len(s_exec) >= 4
+    call(Callback, [false, 'remote command limit reached (4); command not started'])
+    return -1
+  endif
+  var argv = g:SimpleRemoteShellCommand(command)
+  s_next_id += 1
+  var id = s_next_id
+  var key = string(id)
+  var timeout = timeout_ms >= 0 ? timeout_ms : RequestTimeout()
+  s_exec[key] = {callback: Callback, generation: s_remote.generation,
+    output: '', status: -1, exited: false, closed: false, timer: 0}
+  try
+    var job = job_start(argv, {
+      in_io: 'null', out_io: 'pipe', err_io: 'out', out_mode: 'raw',
+      out_cb: (_, text) => ExecOutput(key, text),
+      close_cb: (_) => ExecClosed(key),
+      exit_cb: (_, status) => ExecExited(key, status),
+    })
+    if job_status(job) ==# 'fail'
+      StopExec(key, 'remote command transport could not start')
+      return -1
+    endif
+    if has_key(s_exec, key)
+      s_exec[key].job = job
+      if timeout > 0
+        s_exec[key].timer = timer_start(timeout, (_) => StopExec(key,
+          'command timed out; remote command outcome is unknown'))
+      endif
+    endif
+  catch
+    StopExec(key, 'remote command transport failed; remote command outcome is unknown')
+    return -1
+  endtry
+  return id
+enddef
+
+# Cancellation releases local resources, never asserts rollback or remote death.
+def g:SimpleRemoteCancel(id: number): bool
+  return StopExec(string(id), 'command canceled; remote command outcome is unknown')
 enddef
 
 # Write a text file inside the active workspace atomically.  Callback is

@@ -251,7 +251,8 @@ connection is ready:
   g:SimpleRemoteRemotePath(local_path)
   g:SimpleRemoteShellCommand(command)
   g:SimpleRemoteExecArgv()
-  g:SimpleRemoteExecute(command, Callback)
+  g:SimpleRemoteExecute(command, Callback [, timeout_ms])
+  g:SimpleRemoteCancel(request_id)
   g:SimpleRemoteReadFile(path, Callback)
   g:SimpleRemoteWriteFile(path, content, Callback)
   g:SimpleRemoteListDirectory(path, Callback)
@@ -281,9 +282,19 @@ transport: plain ssh without the runtime re-joins arguments through the
 login shell.  SimpleRemoteShellCommand() remains the choice for shell
 scripts.
 
-SimpleRemoteExecute() runs a shell command in the workspace root over the
-persistent agent connection and calls Callback(ok, output) with the combined
-output; SimpleRemoteWriteFile() writes a text file atomically and calls
+SimpleRemoteExecute() runs a shell command in the workspace root on a separate
+transport and calls Callback(ok, output) exactly once with combined output.
+It returns a request ID, or -1 if not started. Up to four commands run at once;
+excess commands fail immediately, without being queued. Commands cannot block
+file RPCs. Output is capped at 8 MiB. Optional timeout_ms is a local deadline
+(default: request timeout; zero: disabled). SimpleRemoteCancel(id) returns true
+only when it canceled an active command. Timeout, cancel, output overflow and
+disconnect stop the local transport and report failure, but do NOT prove remote
+process termination or undo remote side effects: the remote outcome is unknown.
+Do not automatically retry a mutating command after one of these failures.
+Commands needing a hard remote deadline should explicitly use the remote OS's
+timeout/process supervisor. Use ShellCommand() for streaming output.
+SimpleRemoteWriteFile() writes a text file atomically and calls
 Callback(ok, path-or-error); SimpleRemoteListDirectory() lists a directory
 and calls Callback(ok, entries) with {name, path, type, size, mtime}
 dictionaries (type is 'f', 'd' or 'l').  ReadFile, WriteFile and
@@ -487,11 +498,11 @@ show the latest latency.
         Refresh the Rust runtime environment and latency snapshot.
 
 Programs the runtime starts — g:SimpleRemoteShellCommand(),
-g:SimpleRemoteExecArgv(), g:SimpleRemoteTerminalSpec(), transfers and the
+g:SimpleRemoteExecArgv(), g:SimpleRemoteExecute(), :SimpleRemoteExec,
+:SimpleRemoteFind, :SimpleRemoteGit, g:SimpleRemoteTerminalSpec(), transfers and the
 probe — get project .venv, .conda, venv and env directories on PATH, plus
 $HOME/.local/bin and $HOME/bin, without sourcing interactive shell files.
-The agent's own operations (g:SimpleRemoteExecute(), :SimpleRemoteExec,
-:SimpleRemoteGit, :SimpleRemoteFind, :SimpleRemoteHealth and the tree's
+The agent's own operations (:SimpleRemoteHealth and the tree's
 filesystem actions) run in the agent's environment and do not get that
 prelude.
 
