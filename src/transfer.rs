@@ -4,9 +4,11 @@
 //!
 //! Both directions share the same shape: bytes stream straight between the
 //! transport and a temporary sibling of the destination, and the destination
-//! is only ever activated by a rename.  A crashed transfer therefore leaves at
-//! most a dot-prefixed `.part` entry beside the target and never a truncated
-//! file where a complete one used to be.
+//! is activated by a rename. Files replace without an unlink gap. Replacing
+//! a directory uses a retained sibling backup and best-effort rollback: it
+//! has a visibility gap and may require manual recovery after interruption.
+//! None of these operations promises power-loss durability or synchronization
+//! with another process modifying the same destination.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -79,8 +81,31 @@ pub fn upload_script(args: &RuntimeArgs) -> String {
     );
     if args.recursive {
         return format!(
-            "{common}tmp=$(mktemp -d \"$rdir/.simpleremote-upload.XXXXXX\") || exit {path}; trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM; tar -xf - -C \"$tmp\" || {{ printf 'cannot unpack upload into %s\\n' \"$rdir\" >&2; exit {path}; }}; [ -e \"$tmp/\"{name} ] || {{ printf 'upload did not contain %s\\n' {name} >&2; exit {path}; }}; if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then rm -rf -- \"$dest\"; fi; mv -- \"$tmp/\"{name} \"$dest\" || exit {path}; rmdir -- \"$tmp\"; trap - EXIT; printf 'remote=%s\\n' \"$dest\"",
+            r#"{common}tmp=$(mktemp -d "$rdir/.simpleremote-upload.XXXXXX") || exit {path}; backup='';
+cleanup() {{
+    if [ -n "$backup" ] && {{ [ -e "$backup/previous" ] || [ -L "$backup/previous" ]; }}; then
+        if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+            mv -T -- "$backup/previous" "$dest" || printf 'rollback failed; previous destination retained at %s/previous\n' "$backup" >&2;
+        fi;
+        if [ -e "$backup/previous" ] || [ -L "$backup/previous" ]; then
+            printf 'previous destination retained at %s/previous\n' "$backup" >&2;
+            printf 'backup=%s/previous\n' "$backup";
+        else rmdir -- "$backup"; fi;
+    fi;
+    rm -rf -- "$tmp";
+}};
+trap cleanup EXIT; trap 'exit 1' HUP INT TERM;
+tar -xf - -C "$tmp" || exit {path};
+[ -d "$tmp/"{name} ] && [ ! -L "$tmp/"{name} ] || exit {path};
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+    [ "$force" = 1 ] || exit {exists};
+    backup=$(mktemp -d "$rdir/.simpleremote-backup.XXXXXX") || exit {path};
+    mv -T -- "$dest" "$backup/previous" || exit {path};
+fi;
+mv -T -- "$tmp/"{name} "$dest" || exit {path};
+printf 'remote=%s\n' "$dest""#,
             path = STATUS_PATH,
+            exists = STATUS_EXISTS,
         );
     }
     // `cat` reports success on any EOF, so a stream cut short by a killed
@@ -89,9 +114,10 @@ pub fn upload_script(args: &RuntimeArgs) -> String {
     // the script and is checked before the rename; `wc -c` and the arithmetic
     // test are POSIX, so this works on dash, busybox and BSD sh alike.
     format!(
-        "{common}size={size}; if [ -d \"$dest\" ]; then printf 'remote destination is a directory: %s\\n' \"$dest\" >&2; exit {path}; fi; tmp=$(mktemp \"$rdir/.simpleremote-upload.XXXXXX\") || exit {path}; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; if [ -f \"$dest\" ]; then cp -p -- \"$dest\" \"$tmp\" || exit {path}; fi; cat >\"$tmp\" || exit {path}; got=$(wc -c <\"$tmp\") || exit {path}; [ \"$got\" -eq \"$size\" ] || {{ printf 'upload truncated: %s bytes of %s\\n' \"$got\" \"$size\" >&2; exit {truncated}; }}; mv -f -- \"$tmp\" \"$dest\" || exit {path}; trap - EXIT; printf 'remote=%s\\n' \"$dest\"",
+        "{common}size={size}; if [ -d \"$dest\" ]; then printf 'remote destination is a directory: %s\\n' \"$dest\" >&2; exit {path}; fi; tmp=$(mktemp \"$rdir/.simpleremote-upload.XXXXXX\") || exit {path}; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; if [ -f \"$dest\" ]; then cp -p -- \"$dest\" \"$tmp\" || exit {path}; fi; cat >\"$tmp\" || exit {path}; got=$(wc -c <\"$tmp\") || exit {path}; [ \"$got\" -eq \"$size\" ] || {{ printf 'upload truncated: %s bytes of %s\\n' \"$got\" \"$size\" >&2; exit {truncated}; }}; if [ \"$force\" = 1 ]; then mv -fT -- \"$tmp\" \"$dest\" || exit {path}; else ln -T -- \"$tmp\" \"$dest\" || exit {exists}; rm -f -- \"$tmp\"; fi; trap - EXIT; printf 'remote=%s\\n' \"$dest\"",
         path = STATUS_PATH,
         truncated = STATUS_TRUNCATED,
+        exists = STATUS_EXISTS,
     )
 }
 
@@ -235,24 +261,23 @@ pub fn download(args: &RuntimeArgs) -> Result<u8, String> {
                 entries.len()
             ));
         }
-        entries[0].path()
+        let staged = entries[0].path();
+        if !staged
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            remove_any(&temporary);
+            return Err("download archive did not contain a directory".into());
+        }
+        staged
     } else {
         temporary.clone()
     };
-    if args.force && destination.symlink_metadata().is_ok() {
-        if args.recursive {
-            remove_any(&destination);
-        } else {
-            // Guarded above: this can only be a file or a symlink.
-            let _ = fs::remove_file(&destination);
-        }
-    }
-    if let Err(error) = fs::rename(&staged, &destination) {
+    // Rename files directly: unlinking first destroys the old file on failure.
+    // Non-empty directory replacement needs a recoverable two-rename transaction.
+    if let Err(error) = activate_download(&staged, &destination, args.force, args.recursive) {
         remove_any(&temporary);
-        return Err(format!(
-            "cannot activate download {}: {error}",
-            destination.display()
-        ));
+        return Err(error);
     }
     if args.recursive {
         let _ = fs::remove_dir(&temporary);
@@ -262,6 +287,90 @@ pub fn download(args: &RuntimeArgs) -> Result<u8, String> {
     }
     println!("local={}", destination.display());
     Ok(0)
+}
+
+/// Directory replacement has a visibility gap. Keep the previous destination
+/// in a reserved sibling even after success, so crashes never require deleting
+/// the only old copy. This is recovery support, not a power-loss durability claim.
+fn activate_download(
+    staged: &Path,
+    destination: &Path,
+    force: bool,
+    recursive: bool,
+) -> Result<(), String> {
+    activate_with(staged, destination, force, recursive, |from, to| {
+        fs::rename(from, to)
+    })
+}
+
+fn activate_with(
+    staged: &Path,
+    destination: &Path,
+    force: bool,
+    recursive: bool,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<(), String> {
+    let exists = destination.symlink_metadata().is_ok();
+    if exists && !force {
+        return Err(format!(
+            "local destination already exists: {}",
+            destination.display()
+        ));
+    }
+    if !recursive && !force {
+        // Same-filesystem hard link is an atomic no-clobber activation.
+        fs::hard_link(staged, destination).map_err(|error| {
+            format!(
+                "cannot activate download {}: {error}",
+                destination.display()
+            )
+        })?;
+        let _ = fs::remove_file(staged);
+        return Ok(());
+    }
+    if !recursive || !exists {
+        return rename(staged, destination).map_err(|error| {
+            format!(
+                "cannot activate download {}: {error}",
+                destination.display()
+            )
+        });
+    }
+    let parent = destination_parent(destination)?;
+    let backup = part_path(destination, &parent).with_extension("backup");
+    fs::create_dir(&backup)
+        .map_err(|error| format!("cannot reserve backup {}: {error}", backup.display()))?;
+    let previous = backup.join("previous");
+    if let Err(error) = rename(destination, &previous) {
+        let _ = fs::remove_dir(&backup);
+        return Err(format!(
+            "cannot preserve destination {}: {error}",
+            destination.display()
+        ));
+    }
+    if let Err(error) = rename(staged, destination) {
+        // Avoid an already-observable collision; callers must exclude concurrent
+        // writers because the check and rollback are not atomic.
+        if destination.symlink_metadata().is_err() {
+            if let Err(rollback) = rename(&previous, destination) {
+                return Err(format!(
+                    "activation failed: {error}; rollback failed: {rollback}; previous destination retained at {}",
+                    previous.display()
+                ));
+            }
+            let _ = fs::remove_dir(&backup);
+            return Err(format!(
+                "activation failed: {error}; previous destination restored"
+            ));
+        }
+        return Err(format!(
+            "activation failed: {error}; destination changed; previous destination retained at {}",
+            previous.display()
+        ));
+    }
+    eprintln!("previous destination retained at {}", previous.display());
+    println!("backup={}", previous.display());
+    Ok(())
 }
 
 fn receive_file(mut stdout: impl Read, temporary: &Path) -> Result<u64, String> {
@@ -485,7 +594,7 @@ mod tests {
         assert!(file.contains("case \"$rdir\" in \"$base\"/*|\"$base\")"));
         assert!(file.contains("cp -p -- \"$dest\" \"$tmp\""));
         assert!(file.contains("cat >\"$tmp\""));
-        assert!(file.contains("mv -f -- \"$tmp\" \"$dest\""));
+        assert!(file.contains("mv -fT -- \"$tmp\" \"$dest\""));
         assert!(file.contains("printf 'remote=%s\\n' \"$dest\""));
 
         let tree = upload_script(&RuntimeArgs {
@@ -496,8 +605,8 @@ mod tests {
         assert!(tree.contains("force=1;"));
         assert!(tree.contains("mktemp -d"));
         assert!(tree.contains("tar -xf - -C \"$tmp\""));
-        assert!(tree.contains("[ -e \"$tmp/\"'data' ]"));
-        assert!(tree.contains("mv -- \"$tmp/\"'data' \"$dest\""));
+        assert!(tree.contains("[ -d \"$tmp/\"'data' ]"));
+        assert!(tree.contains("mv -T -- \"$tmp/\"'data' \"$dest\""));
     }
 
     #[test]
@@ -515,5 +624,258 @@ mod tests {
             describe_failure("x", Some(1), b"boom\n"),
             "x (1): boom".to_string()
         );
+    }
+    struct Sandbox(PathBuf);
+    impl Sandbox {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "simpleremote-replace-{}-{}",
+                std::process::id(),
+                stamp()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tree(path: &Path, text: &str) {
+        fs::create_dir(path).unwrap();
+        fs::write(path.join("value"), text).unwrap();
+    }
+
+    #[test]
+    fn file_activation_failure_preserves_original() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        fs::write(&dst, "old").unwrap();
+        assert!(activate_download(&t.0.join("absent"), &dst, true, false).is_err());
+        assert_eq!(fs::read_to_string(dst).unwrap(), "old");
+    }
+
+    #[test]
+    fn file_replaces_symlink_not_its_target() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        let stage = t.0.join("stage");
+        fs::write(t.0.join("original"), "old").unwrap();
+        fs::write(&stage, "new").unwrap();
+        std::os::unix::fs::symlink(t.0.join("original"), &dst).unwrap();
+        activate_download(&stage, &dst, true, false).unwrap();
+        assert_eq!(fs::read_to_string(dst).unwrap(), "new");
+        assert_eq!(fs::read_to_string(t.0.join("original")).unwrap(), "old");
+    }
+
+    #[test]
+    fn directory_success_retains_previous_copy() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        let stage = t.0.join("stage");
+        tree(&dst, "old");
+        tree(&stage, "new");
+        activate_download(&stage, &dst, true, true).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "new");
+        let backup = fs::read_dir(&t.0)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|v| v == "backup"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(backup.path().join("previous/value")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn directory_failure_rolls_back_or_preserves_recovery_copy() {
+        for fail_rollback in [false, true] {
+            let t = Sandbox::new();
+            let dst = t.0.join("dst");
+            let stage = t.0.join("stage");
+            tree(&dst, "old");
+            tree(&stage, "new");
+            let mut call = 0;
+            let result = activate_with(&stage, &dst, true, true, |a, b| {
+                call += 1;
+                if call == 2 || (fail_rollback && call == 3) {
+                    return Err(io::Error::other("injected rename failure"));
+                }
+                fs::rename(a, b)
+            });
+            let error = result.unwrap_err();
+            if fail_rollback {
+                assert!(error.contains("rollback failed"));
+                let backup = fs::read_dir(&t.0)
+                    .unwrap()
+                    .flatten()
+                    .find(|e| e.path().extension().is_some_and(|v| v == "backup"))
+                    .unwrap();
+                assert_eq!(
+                    fs::read_to_string(backup.path().join("previous/value")).unwrap(),
+                    "old"
+                );
+            } else {
+                assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "old");
+            }
+            assert_eq!(fs::read_to_string(stage.join("value")).unwrap(), "new");
+        }
+    }
+
+    #[test]
+    fn force_false_rechecks_destination_before_activation() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        let stage = t.0.join("stage");
+        tree(&dst, "old");
+        tree(&stage, "new");
+        assert!(activate_download(&stage, &dst, false, true).is_err());
+        assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "old");
+    }
+
+    #[test]
+    fn remote_directory_failure_and_success_keep_old_data() {
+        use std::os::unix::fs::PermissionsExt;
+        for failure in ["none", "activate", "rollback"] {
+            let t = Sandbox::new();
+            let dst = t.0.join("dst");
+            tree(&dst, "old");
+            tree(&t.0.join("source"), "new");
+            let archive = Command::new("tar")
+                .args(["-cf", "-", "-C"])
+                .arg(&t.0)
+                .arg("source")
+                .output()
+                .unwrap();
+            assert!(archive.status.success());
+            let bin = t.0.join("bin");
+            fs::create_dir(&bin).unwrap();
+            // Fail activation and optionally rollback. Real /bin/mv handles all other calls.
+            fs::write(bin.join("mv"), format!("#!/bin/sh\ncase \"$3\" in *simpleremote-upload*/source*) [ '{failure}' = none ] || exit 71;; *simpleremote-backup*/previous*) [ '{failure}' != rollback ] || exit 72;; esac\nexec /bin/mv \"$@\"\n")).unwrap();
+            fs::set_permissions(bin.join("mv"), fs::Permissions::from_mode(0o755)).unwrap();
+            let script = upload_script(&RuntimeArgs {
+                root: t.0.to_string_lossy().into(),
+                remote: dst.to_string_lossy().into(),
+                local: "/unused/source".into(),
+                recursive: true,
+                force: true,
+                ..args()
+            });
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&archive.stdout)
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(
+                out.status.success(),
+                failure == "none",
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if failure == "activate" {
+                assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "old");
+            } else {
+                let backup = fs::read_dir(&t.0)
+                    .unwrap()
+                    .flatten()
+                    .find(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(".simpleremote-backup.")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    fs::read_to_string(backup.path().join("previous/value")).unwrap(),
+                    "old"
+                );
+                if failure == "none" {
+                    assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "new");
+                } else {
+                    assert!(String::from_utf8_lossy(&out.stderr).contains("rollback failed"));
+                }
+            }
+        }
+    }
+    #[test]
+    fn remote_file_no_force_does_not_clobber_midstream_creation() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        let script = upload_script(&RuntimeArgs {
+            root: t.0.to_string_lossy().into(),
+            remote: dst.to_string_lossy().into(),
+            size: 3,
+            force: false,
+            ..args()
+        });
+        // Inject a concurrent destination after reception, before activation.
+        let script = script.replace("got=$(wc -c", "printf old >\"$dest\"; got=$(wc -c");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"new").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(!out.status.success());
+        assert_eq!(fs::read_to_string(dst).unwrap(), "old");
+    }
+
+    #[test]
+    fn interrupted_remote_directory_activation_restores_old_destination() {
+        let t = Sandbox::new();
+        let dst = t.0.join("dst");
+        tree(&dst, "old");
+        tree(&t.0.join("source"), "new");
+        let archive = Command::new("tar")
+            .args(["-cf", "-", "-C"])
+            .arg(&t.0)
+            .arg("source")
+            .output()
+            .unwrap();
+        let script = upload_script(&RuntimeArgs {
+            root: t.0.to_string_lossy().into(),
+            remote: dst.to_string_lossy().into(),
+            local: "/unused/source".into(),
+            recursive: true,
+            force: true,
+            ..args()
+        });
+        // Interrupt after the backup rename, before activating received content.
+        let script = script.replace(
+            "mv -T -- \"$tmp/\"'source'",
+            "kill -TERM $$; mv -T -- \"$tmp/\"'source'",
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&archive.stdout)
+            .unwrap();
+        assert!(!child.wait_with_output().unwrap().status.success());
+        assert_eq!(fs::read_to_string(dst.join("value")).unwrap(), "old");
     }
 }

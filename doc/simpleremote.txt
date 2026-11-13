@@ -297,8 +297,13 @@ needs {recursive: true} for a remote directory, because only the remote side
 knows what the path is (the :SimpleRemoteDownload command probes it with
 `test -d` first).  {force: true} replaces an existing destination; without it
 either direction fails with 'already exists', through the runtime and through
-the scp/docker-cp fallback alike.  A download never replaces a local
-directory, forced or not.  Callback(ok, {remote, local, error}) runs when the
+the scp/docker-cp fallback alike.  A single-file download never replaces a local directory. Recursive forced
+replacement through the runtime retains the old destination in a sibling backup
+and attempts rollback if activation fails. The backup remains after success;
+its path is reported on stderr. Directory replacement is not atomic: there is a
+visibility gap and interrupted operations can require manual recovery. Do not
+use concurrent writers at the destination. Remote activation requires GNU or
+compatible mv -T / ln -T; scp/docker-cp fallback has separate guarantees.  Callback(ok, {remote, local, error}) runs when the
 transfer finishes and the matching SimpleRemoteFileCopied /
 SimpleRemoteFileUploaded event fires.
 
@@ -510,7 +515,7 @@ before changing anything.  Copy/cut state is scoped to its SSH host or Docker
 container.  Text and local-download paths use SimpleClipboard when available.
 
 The Rust "download" action streams bytes into a same-directory temporary file
-and atomically activates it.  It never loads the complete file into Vim.
+and activates it (directory overwrite uses the retained-backup protocol).  It never loads the complete file into Vim.
 Fallback keeps text in the unnamed register.  A completed download emits
 SimpleRemoteFileCopied and refreshes SimpleTree.
 

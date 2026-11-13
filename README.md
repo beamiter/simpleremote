@@ -41,9 +41,18 @@ shells share the connection and the same PATH prelude.
 
 `simpleremote-daemon download` and `upload` stream a file — or, with
 `--recursive`, a directory through `tar` — across the boundary, staged beside
-the destination and activated by rename; uploads refuse an existing
-destination unless `--force`. Without the runtime, `scp`/`docker cp` do the
-same job.
+the destination. File replacement uses rename without deleting the old file
+first; no-force file activation uses a no-clobber hard link. Directory overwrite
+with `--force` preserves the old destination inside a uniquely reserved sibling
+backup (`.simpleremote-backup.*` remotely, `.*.backup` locally) before activation.
+The backup remains after success; its path is written to stderr. On an activation
+error the runtime attempts rollback, and reports retained backup paths if recovery
+fails. Directory replacement has a visibility gap, is **not atomic**, and can need
+manual recovery after a killed process. Inspect backups before removing them.
+Use an exclusively owned destination: concurrent writers and power-loss durability
+are not covered. Remote runtime activation requires `mv -T` / `ln -T` (GNU or
+compatible coreutils). Unsupported tools fail rather than deleting the old target.
+Without the runtime, `scp`/`docker cp` retain their separate, weaker guarantees.
 
 Set `g:simpleremote_use_daemon = 0` to disable the runtime, or set
 `g:simpleremote_daemon_path` to a custom build.
@@ -149,7 +158,7 @@ vocabulary. Filesystem actions execute on the remote target:
 `gd` is the cross-boundary download: it streams the selected remote file — or
 directory — through the Rust runtime into `simpletree#ExternalDropDirectory()`
 (or prompts when no local tree exists), staged beside the destination and
-atomically activated; SimpleTree then reveals the new file. `gu` is the
+activated (directory overwrite uses the recoverable backup protocol above); SimpleTree then reveals the new file. `gu` is the
 upload in the other direction: SimpleTree's selected node (or a prompted
 local path) lands in the selected remote directory. `y` copies the file name,
 `Y` copies the absolute remote path, and `gy` copies remote text file
