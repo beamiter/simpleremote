@@ -295,7 +295,9 @@ Do not automatically retry a mutating command after one of these failures.
 Commands needing a hard remote deadline should explicitly use the remote OS's
 timeout/process supervisor. Use ShellCommand() for streaming output.
 SimpleRemoteWriteFile() writes a text file atomically and calls
-Callback(ok, path-or-error); SimpleRemoteListDirectory() lists a directory
+Callback(ok, path-or-error). Existing symlinks and non-regular targets (such
+as FIFOs, devices and directories) are refused without replacing them.
+SimpleRemoteListDirectory() lists a directory
 and calls Callback(ok, entries) with {name, path, type, size, mtime}
 dictionaries (type is 'f', 'd' or 'l').  ReadFile, WriteFile and
 ListDirectory refuse paths outside the workspace; Execute takes a shell

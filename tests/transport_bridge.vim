@@ -350,6 +350,44 @@ def BundledAgentKeepsLegacyListingOperations()
   assert_true(WaitFor(() => job_status(job) !=# 'run'))
 enddef
 
+# A write to a FIFO must be refused, not cp'ed: cp waits for a writer and
+# freezes this serial agent, including every later ping/read/save request.
+def AgentRefusesSpecialWriteTargets()
+  if !has('unix') || !executable('mkfifo')
+    return
+  endif
+  var fifo = BASE .. '/write-target.fifo'
+  system('mkfifo ' .. shellescape(fifo))
+  assert_equal(0, v:shell_error)
+  var replies: list<string> = []
+  var job = job_start([REPO .. '/bin/simpleremote-agent.sh'], {
+    in_io: 'pipe', out_io: 'pipe', err_io: 'pipe', out_mode: 'nl', err_mode: 'nl',
+    out_cb: (_, line) => add(replies, line),
+  })
+  var data = system('base64', 'replacement')->substitute('\n', '', 'g')
+  var payload = system('base64', fifo .. "\t" .. data)->substitute('\n', '', 'g')
+  ch_sendraw(job_getchannel(job), "72\twrite\t" .. payload .. "\n73\tping\t\n")
+  var responsive = WaitFor(() => len(replies) >= 2, 1.0)
+  assert_true(responsive, 'FIFO write blocked the agent and its following ping')
+  if !responsive
+    # Unblock the old implementation's cp so a failing regression leaks no
+    # child process. This fixture is ours; no user FIFO is touched.
+    var writer = job_start(['sh', '-c', 'printf x > ' .. shellescape(fifo)])
+    WaitFor(() => job_status(writer) !=# 'run')
+    WaitFor(() => len(replies) >= 2)
+    job_stop(writer, 'kill')
+  endif
+  if len(replies) >= 2
+    assert_equal('error', split(replies[0], "\t", 1)[1],
+      'a non-regular write target was reported as saved')
+    assert_equal('73', split(replies[1], "\t", 1)[0])
+    assert_equal('ok', split(replies[1], "\t", 1)[1])
+  endif
+  assert_equal('fifo', getftype(fifo), 'write replaced a special file')
+  job_stop(job, 'kill')
+  assert_true(WaitFor(() => job_status(job) !=# 'run'))
+enddef
+
 # The inverse upgrade order: an old agent rejects the encoded operation, and
 # the new Vim side retries list-meta without losing metadata.
 def OldAgentListingFallbackWorks()
@@ -407,6 +445,7 @@ def Run()
 
   MalformedRequestsAreAnswered()
   BundledAgentKeepsLegacyListingOperations()
+  AgentRefusesSpecialWriteTargets()
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
   ReadTimeoutIsReported()
   LargeFileWaitsForConfirmation()

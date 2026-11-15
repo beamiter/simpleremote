@@ -179,6 +179,13 @@ while IFS="$tab" read -r id op payload; do
         continue
       fi
 
+      # cp on a FIFO/device can wait forever and block every later request on
+      # this serial RPC stream. Only ordinary files may be replaced.
+      if [ -e "$path" ] && [ ! -f "$path" ]; then
+        reply "$id" error "refusing to replace non-regular file: $path"
+        continue
+      fi
+
       directory=$(dirname "$path")
       if ! mkdir -p "$directory"; then
         reply "$id" error "cannot create directory: $directory"
