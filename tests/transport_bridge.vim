@@ -96,6 +96,13 @@ def Exercise(protocol: string, agent: string)
     writefile(bytes, BASE .. '/' .. name)
     g:VimrcRemoteOpen(BASE .. '/' .. name)
     assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '') ==# BASE .. '/' .. name))
+    var snapshot_lines = getline(1, '$')
+    var snapshot_eol = &endofline
+    SimpleRemoteCompare
+    assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'ready'))
+    assert_equal(snapshot_lines, getline(1, '$'), protocol .. ': comparison bytes ' .. name)
+    assert_equal(snapshot_eol, &endofline)
+    tabclose
     setlocal nofixendofline
     write
     assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(), 'status', '') ==# 'success'))
@@ -128,6 +135,33 @@ def Exercise(protocol: string, agent: string)
   assert_equal(['other', 'edited ✓ é'], readfile(BASE .. '/utf8.txt'))
   assert_equal('local', getline(1))
   assert_match('changed or disappeared', g:SimpleRemoteWriteState().message)
+  var original = bufnr()
+  var baseline = deepcopy(b:vimrc_remote)
+  var tick = b:changedtick
+  SimpleRemoteCompare
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') !=# 'pending'))
+  assert_equal('ready', get(b:, 'simpleremote_compare_status', ''))
+  assert_equal(['other', 'edited ✓ é'], getline(1, '$'))
+  assert_false(&modifiable)
+  assert_equal('nofile', &buftype)
+  assert_equal(baseline, getbufvar(original, 'vimrc_remote'))
+  assert_equal(tick, getbufvar(original, 'changedtick'))
+  assert_true(getbufvar(original, '&modified'))
+  wincmd p
+  assert_equal(['local', 'edited ✓ é'], getline(1, '$'))
+  assert_false(&modifiable)
+  tabclose
+  assert_equal(original, bufnr())
+  assert_equal('local', getline(1))
+  g:simpleremote_large_file_bytes = 1
+  SimpleRemoteCompare
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'error'))
+  assert_match('large-file limit', getline(2))
+  tabclose
+  SimpleRemoteCompare!
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'ready'))
+  tabclose
+  unlet g:simpleremote_large_file_bytes
   delete(stamp)
 
   # Reopening deliberately after discarding local edits establishes a new baseline.
@@ -139,6 +173,11 @@ def Exercise(protocol: string, agent: string)
   write
   assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(), 'status', '') ==# 'error'))
   assert_false(filereadable(BASE .. '/utf8.txt'), protocol .. ': save must not recreate deleted file')
+  SimpleRemoteCompare
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'error'))
+  assert_match('missing or inaccessible', getline(2))
+  tabclose
+  assert_equal('keep local after remote deletion', getline(1))
   assert_true(&modified)
   writefile(['plain', 'edited ✓ é'], BASE .. '/utf8.txt')
   setlocal nomodified
@@ -277,6 +316,31 @@ def ReadTimeoutIsReported()
 
   unlet g:simpleremote_request_timeout
   sleep 2200m
+  g:VimrcRemoteOpen(BASE .. '/utf8.txt')
+  assert_true(WaitFor(() => !empty(get(b:, 'vimrc_remote', {}))))
+  setline(1, 'preserve through disconnect')
+  var original = bufnr()
+  var baseline = deepcopy(b:vimrc_remote)
+  SimpleRemoteCompare
+  var closing_target = bufnr()
+  sleep 100m
+  setbufline(original, 1, 'new edit during comparison')
+  tabclose
+  sleep 2200m
+  assert_false(bufexists(closing_target))
+  assert_equal(original, bufnr(), 'late reply must not reopen or steal focus')
+  assert_equal('new edit during comparison', getline(1))
+  assert_equal(baseline, b:vimrc_remote)
+  setline(1, 'preserve through disconnect')
+  SimpleRemoteCompare
+  var target = bufnr()
+  SimpleRemoteDisconnect
+  assert_true(WaitFor(() => getbufvar(target, 'simpleremote_compare_status', '') ==# 'error'))
+  assert_equal(baseline, getbufvar(original, 'vimrc_remote'))
+  assert_true(getbufvar(original, '&modified'))
+  assert_equal('preserve through disconnect', getbufline(original, 1)[0])
+  tabclose
+  setlocal nomodified
   unlet g:simpleremote_agent_source
   g:simpleremote_agent = prior_agent
   silent! bwipeout!

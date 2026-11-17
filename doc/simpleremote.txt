@@ -602,6 +602,31 @@ Timeout/disconnect after a successful write can lose its acknowledgement; keep
 your local text, re-read remote contents separately, and merge before retrying.
 No automatic conflict resolution or forced overwrite is provided.
 
+:SimpleRemoteCompare opens a new tab containing two read-only scratch copies:
+local text captured when invoked and a separately fetched remote snapshot.
+The original buffer, modified flag, undo history, and save token are untouched.
+This is a two-way comparison, not a three-way merge: the original base bytes
+are not retained. The snapshot names identify each side; &endofline records
+whether each has a final newline (Vim's visual diff need not highlight this).
+The comparison does not invoke remote filetype detection or execute remote
+modelines.
+
+Close the comparison tab when finished. Edits made in the original while the
+request runs are preserved but do not update the frozen local copy. Remote
+changes after the read likewise need a fresh comparison. Missing/deleted files,
+size-probe failure, timeout, or disconnect show an error rather than an empty
+file that could be mistaken for a valid replacement. Closing the tab discards
+late replies; an already running remote read may still finish.
+
+The normal large-file limit applies before reading. From the original buffer,
+:SimpleRemoteCompare! explicitly permits a larger comparison; the bang never
+permits an overwrite. Size probing is advisory, not a hard transfer cap: a file
+can grow after probing, and snapshots/diff require full-file memory. No source
+save baseline is adopted by viewing or closing a comparison. To resolve a
+conflict, first preserve your local edits separately, deliberately reload the
+original, then reapply the desired edits and save against that fresh baseline.
+There is no automatic merge, forced save, or recovery of a deleted remote file.
+
 The bundled agent requires `sha256sum` or `shasum` for virtual reads/saves; old
 agents or hash failures fail closed instead of silently overwriting. Update the
 plugin, daemon and installed agent together. JSON bridge protocol 2 supports

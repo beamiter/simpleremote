@@ -1284,7 +1284,7 @@ def FinishRemoteWrite(buf: number, generation: number, serial: number, tick: num
     state.message = ok ? 'invalid save acknowledgement; reload before saving' : body
     setbufvar(buf, 'vimrc_remote_write_state', state)
     setbufvar(buf, '&modified', 1)
-    Error('[VimrcRemote] save failed: ' .. body)
+    Error('[VimrcRemote] save failed: ' .. body .. '; :SimpleRemoteCompare opens a read-only comparison')
     return
   endif
   # Even if local edits continued, the ACK establishes the new remote baseline.
@@ -5362,6 +5362,108 @@ enddef
 
 def g:VimrcRemoteRead(uri: string)
   ReadRemote(uri)
+enddef
+
+# Comparison buffers are detached snapshots, never remote write targets. Neither
+# displaying nor closing them changes the original buffer or its save baseline.
+def SetCompareText(buf: number, lines: list<string>, final_eol: bool)
+  setbufvar(buf, '&modifiable', 1)
+  setbufline(buf, 1, empty(lines) ? [''] : lines)
+  var count = max([1, len(lines)])
+  if len(getbufline(buf, 1, '$')) > count
+    deletebufline(buf, count + 1, '$')
+  endif
+  setbufvar(buf, '&endofline', final_eol)
+  setbufvar(buf, '&modified', 0)
+  setbufvar(buf, '&modifiable', 0)
+enddef
+
+def CompareError(buf: number, message: string)
+  if bufexists(buf)
+    SetCompareText(buf, ['SimpleRemote comparison unavailable:', message,
+      'Original local edits and save baseline have not changed.'], false)
+    setbufvar(buf, 'simpleremote_compare_status', 'error')
+  endif
+enddef
+
+def g:SimpleRemoteCompare(force: bool = false)
+  var info = copy(get(b:, 'vimrc_remote', {}))
+  if empty(info) || !IsReady() || !IsCurrent(get(info, 'generation', -1))
+    Error('[SimpleRemote] comparison requires a virtual buffer on the current connection')
+    return
+  endif
+  if get(get(b:, 'vimrc_remote_write_state', {}), 'status', '') ==# 'pending'
+    Error('[SimpleRemote] wait for the pending save before comparing')
+    return
+  endif
+  var local_lines = getline(1, '$')
+  var local_eol = &endofline
+  var source = bufnr()
+  var generation = info.generation
+  var limit = force ? 0 : LargeFileLimit()
+  # A new tab isolates diff options from the user's existing windows. Copies
+  # are frozen at invocation/read time, not a live view and not a three-way merge.
+  tabnew
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted readonly nofixendofline
+  b:simpleremote_compare_source = source
+  b:simpleremote_compare_side = 'local snapshot'
+  execute 'file ' .. fnameescape('[SimpleRemote local #' .. bufnr() .. '] ' .. info.path)
+  SetCompareText(bufnr(), local_lines, local_eol)
+  diffthis
+  vnew
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted readonly nofixendofline
+  b:simpleremote_compare_source = source
+  b:simpleremote_compare_side = 'remote snapshot'
+  execute 'file ' .. fnameescape('[SimpleRemote remote #' .. bufnr() .. '] ' .. info.path)
+  b:simpleremote_compare_status = 'pending'
+  var target = bufnr()
+  SetCompareText(target, ['Reading remote snapshot; original buffer unchanged.'], false)
+  diffthis
+  Send('exec', {command: SizeProbeCommand(info.path)}, (ok, body) => {
+    if !bufexists(target)
+      return
+    endif
+    if !IsCurrent(generation)
+      CompareError(target, 'Connection changed; request a new comparison.')
+      return
+    endif
+    var size = ok ? ParseProbedSize(body) : -1
+    if size < 0
+      CompareError(target, 'Cannot determine remote size (file missing or inaccessible).')
+      return
+    endif
+    if limit > 0 && size > limit
+      CompareError(target, 'Remote file exceeds the large-file limit. Run :SimpleRemoteCompare! from the original buffer to read it deliberately.')
+      return
+    endif
+    Send('read-snapshot', {path: info.path}, (read_ok, reply) => {
+      if !bufexists(target)
+        return
+      endif
+      if !IsCurrent(generation)
+        CompareError(target, 'Connection changed; request a new comparison.')
+        return
+      endif
+      var fields = split(reply, "\t", true)
+      if !read_ok || len(fields) != 2 || fields[0] !~# '^[0-9a-f]\{64}$'
+        CompareError(target, read_ok ? 'Invalid remote snapshot.' : reply)
+        return
+      endif
+      var lines = DecodeBase64ToLines(fields[1])
+      if empty(lines) && !empty(fields[1])
+        CompareError(target, 'Cannot decode remote snapshot.')
+        return
+      endif
+      var eol = len(lines) > 1 && lines[-1] ==# ''
+      if eol
+        remove(lines, -1)
+      endif
+      SetCompareText(target, lines, eol)
+      setbufvar(target, 'simpleremote_compare_status', 'ready')
+      setbufvar(target, 'simpleremote_compare_token', fields[0])
+      # No source snapshot/token update: viewing is never permission to overwrite.
+    }, false, ReadTimeoutFor(size))
+  })
 enddef
 
 def g:VimrcRemoteWrite()
