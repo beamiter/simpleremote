@@ -50,6 +50,10 @@ functions cannot be made transparent in virtual mode.
 :SimpleRemoteLoad             Read the file a deferred remote buffer stands
                               for (see |simpleremote-large-files|).  <CR> in
                               such a buffer does the same.
+:SimpleRemoteCompare[!]       Compare frozen local and remote snapshots in a
+                              new read-only diff tab.  ! permits a larger
+                              snapshot, never an overwrite; see
+                              |:SimpleRemoteCompare|.
 :SimpleRemoteExec {command}   Execute in the remote workspace root.
 :SimpleRemoteFind {query}     Find remote file names.
 :SimpleRemoteGit {args}       Run remote Git and populate quickfix.
@@ -156,13 +160,16 @@ Opening a file over g:simpleremote_large_file_bytes therefore transfers
 nothing.  The buffer holds a hint naming the file and its size, is not
 modifiable, and refuses :write so it can never be saved over the file it
 stands for.  <CR>, or :SimpleRemoteLoad, reads it into that same buffer; a
-confirmed read also gets a timeout scaled to the size, so a deliberate one is
-not cut off by g:simpleremote_request_timeout.
+confirmed read gets a timeout scaled to the known size.  If the size is
+unknown, it uses g:simpleremote_request_timeout.  Existing transport limits
+and timeouts still apply.
 
 The size is measured with one small request before the read, which is also
-what lets an ordinary read size its own timeout.  A size that cannot be
-measured is never a reason to hold a file back: the read runs and reports
-whatever is actually wrong with it.
+what lets an ordinary read size its own timeout.  If metadata is unavailable,
+the read still attempts a snapshot, but a positive large-file limit remains
+enforced by the agent.  Oversize snapshots are rejected, not shown as truncated
+successes, and offer :SimpleRemoteLoad for an explicit unbounded read.  Read
+errors are reported normally; see |:SimpleRemoteCompare| for snapshot limits.
 
 Events expose their payload in g:simpleremote_event.  Every payload carries
 "event" (the event name), "status" (g:simpleremote_status at the time) and
@@ -574,7 +581,10 @@ The virtual tree accepts the SimpleTree-compatible action surface:
 All keys in SimpleTree's built-in help panel have a virtual-tree counterpart
 except gx: a remote path has no dependable local system-default application.
 Modification-time and size sorting require the current bundled remote agent;
-run :SimpleRemoteInstallAgent after upgrading an older installation.
+reconnect after upgrading the plugin to install or update it automatically.
+:SimpleRemoteInstallAgent is a manual force-reinstall option, not a required
+upgrade step.  An unwritable agent destination may leave the old agent in use;
+see |simpleremote-runtime|.
 
 *:SimpleRemoteTreeRoot* {path}
         Change the connected workspace root.  Projection discovery, tab-local
@@ -602,6 +612,7 @@ Timeout/disconnect after a successful write can lose its acknowledgement; keep
 your local text, re-read remote contents separately, and merge before retrying.
 No automatic conflict resolution or forced overwrite is provided.
 
+*:SimpleRemoteCompare*
 :SimpleRemoteCompare opens a new tab containing two read-only scratch copies:
 local text captured when invoked and a separately fetched remote snapshot.
 The original buffer, modified flag, undo history, and save token are untouched.
