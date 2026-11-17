@@ -3457,16 +3457,32 @@ def RemoteTreeDelete()
       return
     endif
   endfor
+  var generation = s_remote.generation
   var label = len(nodes) == 1 ? nodes[0].path : printf('%d marked nodes', len(nodes))
   if get(g:, 'simpleremote_confirm_delete', 1)
         && confirm('Delete remote ' .. label .. '?', "&Delete\n&Cancel", 2) != 1
     return
   endif
+  CompleteRemoteTreeDelete(nodes, generation, label)
+enddef
+
+# Confirmation can run timers and channel callbacks. Revalidate the exact
+# connection and unsaved/pending buffers immediately before sending deletion.
+def CompleteRemoteTreeDelete(nodes: list<any>, generation: number, label: string)
+  if !IsCurrent(generation) || !IsReady()
+    Error('[SimpleRemote] connection changed; delete canceled')
+    return
+  endif
+  for node in nodes
+    if node.path ==# get(s_tree, 'root', '') || !empty(ModifiedRemoteBufferUnder(node.path))
+      Error('[SimpleRemote] source modified/pending write; delete canceled')
+      return
+    endif
+  endfor
   var commands = ['set -e']
   for node in nodes
     add(commands, 'rm -rf ' .. shellescape(node.path))
   endfor
-  var generation = s_remote.generation
   Send('exec', {command: join(commands, '; ')}, (ok, body) => {
     if ok && IsCurrent(generation)
       AnnounceFilesChanged(mapnew(nodes,

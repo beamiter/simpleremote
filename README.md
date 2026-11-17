@@ -193,3 +193,9 @@ all active modes. Size and modification-time sorting use the bundled agent's
 `:SimpleRemoteInstallAgent`. The only SimpleTree key in the documented panel
 without a virtual equivalent is `gx`, because a remote path has no reliable
 local system-default application.
+
+Remote tree deletion rechecks the active connection and modified/pending-write
+buffers after confirmation. If either changed while the dialog was open, the
+operation is canceled; review the file and invoke delete again. This protects
+local asynchronous changes during confirmation, not concurrent edits by other
+remote processes after the delete command has been sent.

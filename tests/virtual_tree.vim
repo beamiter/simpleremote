@@ -145,6 +145,10 @@ def WriteAckCases()
   assert_false(Sr('CompleteRemoteTreeRename', BASE .. '/dest/nested.txt',
     BASE .. '/dest/should-not-rename-pending.txt', generation),
     'clean pending writes block the actual remote rename mutation')
+  Sr('CompleteRemoteTreeDelete', [{path: BASE .. '/dest/nested.txt'}],
+    generation, 'pending fixture')
+  assert_true(filereadable(BASE .. '/dest/nested.txt'),
+    'delete completion must preserve a clean buffer with a pending write')
   assert_true(filereadable(BASE .. '/dest/nested.txt'))
   assert_false(filereadable(BASE .. '/dest/should-not-rename-pending.txt'))
   Sr('ReadRemote', 'remote://' .. BASE .. '/dest/nested.txt')
@@ -155,6 +159,23 @@ def WriteAckCases()
   assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
   assert_equal(b:changedtick, g:SimpleRemoteWriteState(buffer).tick)
   assert_equal(1, g:write_ack_posts, 'successful clean write still emits BufWritePost')
+
+  setline(1, 'unsaved after confirmation')
+  Sr('CompleteRemoteTreeDelete', [{path: BASE .. '/dest/nested.txt'}],
+    generation, 'modified fixture')
+  assert_true(filereadable(BASE .. '/dest/nested.txt'),
+    'delete completion must preserve a newly modified buffer')
+  assert_equal('unsaved after confirmation', getline(1))
+  setline(1, 'nested')
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
+
+  g:write_ack_posts = 1  # This fixture's extra clean save is not part of ACK counts.
+  var victim = BASE .. '/delete-boundary.txt'
+  writefile(['preserve'], victim)
+  Sr('CompleteRemoteTreeDelete', [{path: victim}], generation - 1, 'old connection')
+  sleep 50m
+  assert_true(filereadable(victim), 'old connection deletion must not reach the new agent')
 
   # Undo can make a pending buffer nominally clean while the remote is about
   # to install the request's newer snapshot. The ACK must mark it stale/dirty.
@@ -403,6 +424,11 @@ def Run()
       'gitignore toggle did not reveal ignored file: '
         .. g:SimpleRemoteTreeStatusline() .. ' ' .. string(TreeNodes()))
   endif
+  Sr('CompleteRemoteTreeDelete', [{path: BASE .. '/delete-boundary.txt'}],
+    g:simpleremote_workspace.id, 'valid fixture')
+  assert_true(WaitFor(() => !filereadable(BASE .. '/delete-boundary.txt')),
+    'valid deletion still reaches the agent')
+
 enddef
 
 var failure = ''

@@ -13,6 +13,7 @@ check:
 	vim -Nu NONE -n -i NONE -es -S tests/defcompile.vim
 	$(MAKE) workspace-sync
 	$(MAKE) virtual-tree
+	python3 tests/tree_confirm.py
 	$(MAKE) runtime-exec
 	$(MAKE) command-lifecycle
 	$(MAKE) transport-bridge
