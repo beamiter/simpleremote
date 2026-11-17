@@ -199,3 +199,28 @@ buffers after confirmation. If either changed while the dialog was open, the
 operation is canceled; review the file and invoke delete again. This protects
 local asynchronous changes during confirmation, not concurrent edits by other
 remote processes after the delete command has been sent.
+
+## Conflict-aware virtual saves
+
+Virtual `remote://` buffers carry a SHA-256 token of the exact bytes read. A save
+checks that token immediately before replacing the remote file. External edits
+(including same-size, same-mtime edits) or deletion cause a visible error and
+retain local edits; `:write!` does not bypass this protection. A second save is
+refused until the first acknowledgement arrives. If you keep typing during a
+save, the acknowledged snapshot becomes the new baseline while newer local
+edits remain modified.
+
+This is optimistic conflict detection, **not atomic compare-and-swap**: another
+process or connection may still write between the check and replacement.
+Timeout/disconnect after a successful write can lose its acknowledgement; keep
+your local text, re-read remote contents separately, and merge before retrying.
+No automatic conflict resolution or forced overwrite is provided.
+
+The bundled agent requires `sha256sum` or `shasum` for virtual reads/saves; old
+agents or hash failures fail closed instead of silently overwriting. Update the
+plugin, daemon and installed agent together. JSON bridge protocol 2 supports
+conditional writes; an older daemon falls back to the legacy transport. Both
+paths perform full-file snapshots/hashing with O(n) memory/work, not incremental
+sync. Projected local/mounted files and explicit `SimpleRemoteWriteFile` calls
+retain their existing semantics and are outside this protection. Existing
+file-check/read races and filesystem blocking are not eliminated by hashing.

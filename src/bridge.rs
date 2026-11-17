@@ -73,6 +73,8 @@ struct Request {
     content: Option<String>,
     #[serde(default)]
     content_b64: Option<String>,
+    #[serde(default)]
+    expected_token: Option<String>,
 }
 
 type Ops = Arc<Mutex<HashMap<u64, String>>>;
@@ -316,12 +318,13 @@ fn reject_agent_field(name: &str, value: &str) -> Result<(), String> {
 fn encode_payload(request: &Request) -> Result<String, String> {
     let raw: Vec<u8> = match request.op.as_str() {
         "ping" => Vec::new(),
-        "read" | "read-config" | "list" | "list-meta" | "list-encoded" | "list-meta-encoded" => {
+        "read" | "read-config" | "read-snapshot" | "list" | "list-meta" | "list-encoded"
+        | "list-meta-encoded" => {
             reject_agent_field("path", &request.path)?;
             request.path.as_bytes().to_vec()
         }
         "exec" | "grep" => request.command.as_bytes().to_vec(),
-        "write" => {
+        "write" | "write-checked" => {
             if request.path.is_empty() {
                 return Err("write requires a path".to_string());
             }
@@ -340,6 +343,18 @@ fn encode_payload(request: &Request) -> Result<String, String> {
             };
             let mut raw = request.path.as_bytes().to_vec();
             raw.push(b'\t');
+            if request.op == "write-checked" {
+                let token = request.expected_token.as_deref().unwrap_or_default();
+                if token.len() != 64
+                    || !token
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err("write-checked requires a SHA-256 snapshot".into());
+                }
+                raw.extend_from_slice(token.as_bytes());
+                raw.push(b'\t');
+            }
             raw.extend_from_slice(inner.as_bytes());
             raw
         }
@@ -581,6 +596,30 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(decode(&write), b"/f\taGkK");
+    }
+
+    #[test]
+    fn conditional_write_carries_an_exact_snapshot() {
+        let token = "a".repeat(64);
+        let req = request(&format!(
+            r#"{{"id":5,"op":"write-checked","path":"/f","expected_token":"{token}","content_b64":"AAo="}}"#
+        ));
+        assert_eq!(
+            decode(&encode_payload(&req).unwrap()),
+            format!("/f\t{token}\tAAo=").as_bytes()
+        );
+        assert!(
+            encode_payload(&request(
+                r#"{"id":1,"op":"write-checked","path":"/f","content":"x"}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            encode_payload(&request(
+                r#"{"id":1,"op":"write-checked","path":"/f","content":"x","expected_token":"bad"}"#
+            ))
+            .is_err()
+        );
     }
 
     #[test]

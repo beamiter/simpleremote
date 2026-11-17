@@ -86,6 +86,23 @@ def Exercise(protocol: string, agent: string)
   assert_true(WaitFor(() => done), protocol .. ': binary read did not finish')
   assert_equal(readfile(BASE .. '/latin.bin', 'b')[0] .. "\n", body)
 
+  # Conditional snapshots preserve bytes across both protocol paths.
+  for [name, bytes] in items({
+    'snapshot-nul.bin': 0z00FF0A80,
+    'snapshot-crlf.txt': 0z610D0A620D0A,
+    'snapshot-noeol.txt': 0z616263,
+    'snapshot-empty.txt': 0z,
+  })
+    writefile(bytes, BASE .. '/' .. name)
+    g:VimrcRemoteOpen(BASE .. '/' .. name)
+    assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '') ==# BASE .. '/' .. name))
+    setlocal nofixendofline
+    write
+    assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(), 'status', '') ==# 'success'))
+    assert_equal(bytes, readblob(BASE .. '/' .. name), protocol .. ': snapshot byte round trip ' .. name)
+    silent! bwipeout!
+  endfor
+
   # Buffer round trip through :w, including a final newline and non-ASCII.
   g:VimrcRemoteOpen(BASE .. '/utf8.txt')
   assert_true(WaitFor(() => get(get(b:, 'vimrc_remote', {}), 'path', '')
@@ -98,6 +115,33 @@ def Exercise(protocol: string, agent: string)
     protocol .. ': remote write did not land')
   assert_true(WaitFor(() => !&modified), protocol .. ': buffer stayed modified')
   assert_equal('success', g:SimpleRemoteWriteState().status, protocol .. ': write ACK was not recorded')
+
+  # Same-size edits (including unchanged mtime) must not silently overwrite.
+  var stamp = BASE .. '/mtime-reference'
+  system('touch -r ' .. shellescape(BASE .. '/utf8.txt') .. ' ' .. shellescape(stamp))
+  writefile(['other', 'edited ✓ é'], BASE .. '/utf8.txt')
+  system('touch -r ' .. shellescape(stamp) .. ' ' .. shellescape(BASE .. '/utf8.txt'))
+  setline(1, 'local')
+  write!
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(), 'status', '') ==# 'error'))
+  assert_true(&modified, protocol .. ': conflict keeps local edits')
+  assert_equal(['other', 'edited ✓ é'], readfile(BASE .. '/utf8.txt'))
+  assert_equal('local', getline(1))
+  assert_match('changed or disappeared', g:SimpleRemoteWriteState().message)
+  delete(stamp)
+
+  # Reopening deliberately after discarding local edits establishes a new baseline.
+  setlocal nomodified
+  g:VimrcRemoteOpen(BASE .. '/utf8.txt')
+  assert_true(WaitFor(() => getline(1) ==# 'other'))
+  delete(BASE .. '/utf8.txt')
+  setline(1, 'keep local after remote deletion')
+  write
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(), 'status', '') ==# 'error'))
+  assert_false(filereadable(BASE .. '/utf8.txt'), protocol .. ': save must not recreate deleted file')
+  assert_true(&modified)
+  writefile(['plain', 'edited ✓ é'], BASE .. '/utf8.txt')
+  setlocal nomodified
 
   # Public helpers over the persistent agent connection.
   done = false
@@ -216,7 +260,7 @@ def ReadTimeoutIsReported()
   var prior_agent = g:simpleremote_agent
   var slow_agent = BASE .. '/slow-agent.sh'
   var source = readfile(REPO .. '/bin/simpleremote-agent.sh')
-  insert(source, '      sleep 2', index(source, '    read)') + 1)
+  insert(source, '      sleep 2', index(source, '    read-snapshot)') + 1)
   writefile(source, slow_agent)
   g:simpleremote_agent_source = slow_agent
   g:simpleremote_agent = AGENT_DIR .. '/slow/simpleremote-agent.sh'
@@ -439,7 +483,7 @@ enddef
 
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
-  assert_equal(1, get(capabilities, 'bridge_protocol', 0),
+  assert_equal(2, get(capabilities, 'bridge_protocol', 0),
     'runtime does not advertise the bridge protocol')
   assert_true(index(get(capabilities, 'actions', []), 'upload') >= 0)
 

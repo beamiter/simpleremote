@@ -14,6 +14,7 @@ check:
 	$(MAKE) workspace-sync
 	$(MAKE) virtual-tree
 	python3 tests/tree_confirm.py
+	python3 tests/conditional_save.py
 	$(MAKE) runtime-exec
 	$(MAKE) command-lifecycle
 	$(MAKE) transport-bridge

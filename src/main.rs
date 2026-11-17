@@ -89,7 +89,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Bumped when the JSON bridge or the agent bootstrap changes shape.  Vim reads
 /// it from `capabilities` and refuses protocol modes it does not understand.
-pub const BRIDGE_PROTOCOL: u32 = 1;
+pub const BRIDGE_PROTOCOL: u32 = 2;
 
 /// The heredoc delimiter used to ship the agent script through the transport.
 /// The agent must never contain this line; the bootstrap builder checks.

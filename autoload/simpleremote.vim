@@ -23,7 +23,7 @@ const PROTOCOL = 'simpleremote/2'
 const SCRIPT_ROOT = fnamemodify(expand('<sfile>:p'), ':h:h')
 # The JSON bridge revision this Vim side speaks; the runtime advertises its own
 # in `simpleremote-daemon capabilities` and the two must agree.
-const BRIDGE_PROTOCOL = 1
+const BRIDGE_PROTOCOL = 2
 
 g:vimrc_remote_status = 'disconnected'
 g:simpleremote_status = 'disconnected'
@@ -183,9 +183,11 @@ enddef
 # every encoding step in-process and Vim exchanges plain JSON objects; without
 # it, Vim spawns `base64` itself exactly as it always has.
 def LegacyPayload(op: string, args: dict<any>): string
-  if op ==# 'write'
+  if (op ==# 'write' || op ==# 'write-checked')
     # content_b64 is already the agent's inner layer, byte for byte.
-    return get(args, 'path', '') .. "\t" .. (has_key(args, 'content_b64')
+    return get(args, 'path', '') .. "\t"
+      .. (op ==# 'write-checked' ? get(args, 'expected_token', '') .. "\t" : '')
+      .. (has_key(args, 'content_b64')
       ? args.content_b64 : B64(get(args, 'content', '')))
   endif
   if op ==# 'exec' || op ==# 'grep'
@@ -197,12 +199,12 @@ enddef
 def WireLine(id: number, op: string, args: dict<any>): string
   if get(s_remote, 'protocol', 'legacy') ==# 'json'
     var request = extend({id: id, op: op}, args, 'keep')
-    if op ==# 'write' && !has_key(request, 'content_b64')
+    if (op ==# 'write' || op ==# 'write-checked') && !has_key(request, 'content_b64')
       # json_encode() replaces invalid UTF-8 with U+FFFD; base64 keeps every
       # byte of a latin-1 or mixed-encoding buffer intact on the way out.
       request.content_b64 = B64(get(args, 'content', ''))
     endif
-    if op ==# 'write' && has_key(request, 'content')
+    if (op ==# 'write' || op ==# 'write-checked') && has_key(request, 'content')
       remove(request, 'content')
     endif
     return json_encode(request) .. "\n"
@@ -981,7 +983,7 @@ def ResolveRemotePath(path: string): string
 enddef
 
 def ApplyRemoteRead(buf: number, generation: number, request_id: number,
-    remote_path: string, uri: string, ok: bool, body: list<string>)
+    remote_path: string, uri: string, ok: bool, body: list<string>, snapshot: string = '')
   if !IsCurrent(generation) || !bufexists(buf)
     return
   endif
@@ -1027,6 +1029,7 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     path: remote_path,
     uri: uri,
     generation: generation,
+    snapshot: snapshot,
   })
   setbufvar(buf, '&modified', 0)
   # A fresh successful read is a new disk snapshot. Completed write ACKs refer
@@ -1108,9 +1111,21 @@ enddef
 def StartRemoteRead(buf: number, generation: number, remote_path: string,
     uri: string, timeout: number = -1)
   var request_id = 0
-  request_id = Send('read', {path: remote_path}, (ok, body) =>
-    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, ok, body),
-    true, timeout)
+  request_id = Send('read-snapshot', {path: remote_path}, (ok, body) => {
+    var fields = split(body, "\t", true)
+    if !ok || len(fields) != 2 || fields[0] !~# '^[0-9a-f]\{64}$'
+      ApplyRemoteRead(buf, generation, request_id, remote_path, uri, false,
+        [ok ? 'invalid remote snapshot; update agent/runtime' : body])
+      return
+    endif
+    var lines = DecodeBase64ToLines(fields[1])
+    if empty(lines) && !empty(fields[1])
+      ApplyRemoteRead(buf, generation, request_id, remote_path, uri, false,
+        ['cannot decode file snapshot'])
+      return
+    endif
+    ApplyRemoteRead(buf, generation, request_id, remote_path, uri, true, lines, fields[0])
+  }, false, timeout)
   if request_id >= 0
     setbufvar(buf, 'vimrc_remote_read', {
       request_id: request_id,
@@ -1263,14 +1278,18 @@ def FinishRemoteWrite(buf: number, generation: number, serial: number, tick: num
     setbufvar(buf, '&modified', 1)
     return
   endif
-  if !ok
+  var acknowledged = ok && body =~# '^[0-9a-f]\{64}$'
+  if !acknowledged
     state.status = 'error'
-    state.message = body
+    state.message = ok ? 'invalid save acknowledgement; reload before saving' : body
     setbufvar(buf, 'vimrc_remote_write_state', state)
     setbufvar(buf, '&modified', 1)
     Error('[VimrcRemote] save failed: ' .. body)
     return
   endif
+  # Even if local edits continued, the ACK establishes the new remote baseline.
+  info.snapshot = body
+  setbufvar(buf, 'vimrc_remote', info)
   if getbufvar(buf, 'changedtick', -1) == tick && BufferHasFinalEol(buf) == final_eol
     state.status = 'success'
     state.message = ''
@@ -1296,11 +1315,15 @@ def FinishRemoteWrite(buf: number, generation: number, serial: number, tick: num
     setbufvar(buf, '&modified', 1)
     echomsg '[VimrcRemote] ' .. state.message
   endif
-  echomsg '[VimrcRemote] saved ' .. body
+  echomsg '[VimrcRemote] saved ' .. info.path
 enddef
 
 def WriteRemote(buf: number = bufnr())
   if !bufexists(buf)
+    return
+  endif
+  if get(getbufvar(buf, 'vimrc_remote_write_state', {}), 'status', '') ==# 'pending'
+    Error('[VimrcRemote] wait for the pending save acknowledgement before saving again')
     return
   endif
   s_write_serial += 1
@@ -1325,6 +1348,9 @@ def WriteRemote(buf: number = bufnr())
     if empty(info)
       throw 'buffer is not backed by a remote file'
     endif
+    if get(info, 'snapshot', '') !~# '^[0-9a-f]\{64}$'
+      throw 'missing remote snapshot; reload before saving'
+    endif
     var generation = s_remote.generation
     if get(info, 'generation', -1) != generation
       throw 'buffer belongs to an old connection; reopen it first'
@@ -1346,7 +1372,7 @@ def WriteRemote(buf: number = bufnr())
     state.path = info.path
     setbufvar(buf, 'vimrc_remote_write_state', state)
     var encoded = EncodeLinesToBase64(getbufline(buf, 1, '$'), final_eol)
-    Send('write', {path: info.path, content_b64: encoded}, (ok, body) =>
+    Send('write-checked', {path: info.path, expected_token: info.snapshot, content_b64: encoded}, (ok, body) =>
       FinishRemoteWrite(buf, generation, serial, tick, final_eol, ok, body))
   catch
     if get(getbufvar(buf, 'vimrc_remote_write_state', {}), 'serial', -1) == serial

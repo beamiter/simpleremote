@@ -73,6 +73,21 @@ encode_file() {
   encode_output=
   return "$encode_status"
 }
+# Hash bytes, not timestamps; read snapshots and staged writes use the same file.
+file_token() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    token_line=$(sha256sum <"$1") || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    token_line=$(shasum -a 256 <"$1") || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${token_line%% *}"
+}
+valid_token() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1;; esac
+}
 list_directory() {
   list_root=$1
   list_meta=${2:-0}
@@ -137,6 +152,23 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "not a file: $path"
       fi
       ;;
+    read-snapshot)
+      if ! path=$(decode "${payload:-}") || [ ! -f "$path" ]; then
+        reply "$id" error "not a file: ${path:-}"
+        continue
+      fi
+      tmp=$(mktemp "${TMPDIR:-/tmp}/simpleremote-snapshot.XXXXXX") || {
+        reply "$id" error "cannot create read snapshot"
+        continue
+      }
+      if cp "$path" "$tmp" && token=$(file_token "$tmp") && valid_token "$token" && file_data=$(encode_file "$tmp"); then
+        reply "$id" ok "$token$tab$file_data"
+      else
+        reply "$id" error "cannot snapshot file; sha256sum or shasum required: $path"
+      fi
+      rm -f "$tmp"
+      tmp=
+      ;;
     read-config)
       if ! path=$(decode "${payload:-}"); then
         reply "$id" error "invalid read-config payload"
@@ -152,7 +184,7 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "config not found: $path"
       fi
       ;;
-    write)
+    write|write-checked)
       # The outer payload is decoded by the operation handler.  The resulting
       # value is path<TAB>base64(content).  Keeping content encoded while it is
       # in a shell variable avoids command substitution stripping final LFs.
@@ -170,6 +202,17 @@ while IFS="$tab" read -r id op payload; do
           continue
           ;;
       esac
+      expected=
+      if [ "$op" = write-checked ]; then
+        case "$data" in
+          *"$tab"*) expected=${data%%"$tab"*}; data=${data#*"$tab"} ;;
+          *) reply "$id" error "missing file snapshot; reload before saving"; continue ;;
+        esac
+        if ! valid_token "$expected"; then
+          reply "$id" error "invalid file snapshot; reload before saving"
+          continue
+        fi
+      fi
       if [ -z "$path" ]; then
         reply "$id" error "invalid write path"
         continue
@@ -208,9 +251,30 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "cannot decode/write: $path"
         continue
       fi
+      if [ "$op" = write-checked ]; then
+        # Hash the staged bytes first so this work does not widen the
+        # remaining check-to-rename window against external writers.
+        if ! saved_token=$(file_token "$tmp") || ! valid_token "$saved_token"; then
+          rm -f "$tmp"
+          tmp=
+          reply "$id" error "cannot hash staged file"
+          continue
+        fi
+        # Optimistic check, not atomic CAS against other connections/processes.
+        if [ -L "$path" ] || [ ! -f "$path" ] || ! current=$(file_token "$path") || [ "$current" != "$expected" ]; then
+          rm -f "$tmp"
+          tmp=
+          reply "$id" error "remote file changed or disappeared; reload and merge before saving: $path"
+          continue
+        fi
+      fi
       if mv "$tmp" "$path"; then
         tmp=
-        reply "$id" ok "$path"
+        if [ "$op" = write-checked ]; then
+          reply "$id" ok "$saved_token"
+        else
+          reply "$id" ok "$path"
+        fi
       else
         rm -f "$tmp"
         tmp=

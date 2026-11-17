@@ -206,24 +206,21 @@ def WriteAckCases()
   write
   assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
 
-  # Two in-flight writes: a prior reply must not replace the newer pending
-  # serial or mark the latest buffer clean. Exercise the same callback directly
-  # before the genuine queued agent replies arrive.
+  # A second write must not race a pending snapshot's baseline.
   g:SimpleRemoteExecute('sleep 0.15', (_, _) => 0)
   setline(1, 'first queued snapshot')
   write
   var first = g:SimpleRemoteWriteState(buffer)
   setline(1, 'second queued snapshot')
   write
-  var latest = g:SimpleRemoteWriteState(buffer)
-  assert_true(latest.serial > first.serial)
-  Sr('FinishRemoteWrite', buffer, generation, first.serial, first.tick, first.final_eol, true, 'old reply')
-  assert_equal(latest, g:SimpleRemoteWriteState(buffer), 'old ACK leaves newer pending identity untouched')
+  assert_equal(first, g:SimpleRemoteWriteState(buffer), 'duplicate save preserves pending identity')
+  assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'stale'))
   assert_true(&modified)
+  assert_equal(['first queued snapshot'], readfile(BASE .. '/dest/nested.txt'))
+  write
   assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
-  assert_equal(latest.serial, g:SimpleRemoteWriteState(buffer).serial)
   assert_equal(['second queued snapshot'], readfile(BASE .. '/dest/nested.txt'))
-  assert_equal(4, g:write_ack_posts, 'superseded ACK does not emit a second BufWritePost')
+  assert_equal(4, g:write_ack_posts, 'only the acknowledged current snapshot emits BufWritePost')
 
   # Agent refusal is observable to a caller even if its own write command did
   # not throw. Use a symlink, which the installed agent refuses to replace.
@@ -236,7 +233,7 @@ def WriteAckCases()
   assert_match('symbolic link', g:SimpleRemoteWriteState(buffer).message)
   assert_equal(4, g:write_ack_posts, 'failed ACK does not emit BufWritePost')
   delete(BASE .. '/dest/nested.txt')
-  writefile(['nested'], BASE .. '/dest/nested.txt')
+  writefile(['second queued snapshot'], BASE .. '/dest/nested.txt')
   setline(1, 'nested')
   write
   assert_true(WaitFor(() => get(g:SimpleRemoteWriteState(buffer), 'status', '') ==# 'success'))
