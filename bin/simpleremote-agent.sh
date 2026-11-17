@@ -152,8 +152,26 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "not a file: $path"
       fi
       ;;
-    read-snapshot)
-      if ! path=$(decode "${payload:-}") || [ ! -f "$path" ]; then
+    read-snapshot|read-snapshot-limited)
+      limit=0
+      if ! path=$(decode "${payload:-}"); then
+        reply "$id" error "invalid snapshot payload"
+        continue
+      fi
+      if [ "$op" = read-snapshot-limited ]; then
+        case "$path" in
+          *"$tab"*) limit=${path%%"$tab"*}; path=${path#*"$tab"} ;;
+          *) reply "$id" error "missing snapshot byte limit"; continue ;;
+        esac
+        case "$limit" in
+          ''|*[!0-9]*|0*) reply "$id" error "invalid snapshot byte limit"; continue ;;
+        esac
+        if [ "${#limit}" -gt 10 ] || [ "$limit" -gt 2147483646 ]; then
+          reply "$id" error "snapshot byte limit too large"
+          continue
+        fi
+      fi
+      if [ ! -f "$path" ]; then
         reply "$id" error "not a file: ${path:-}"
         continue
       fi
@@ -161,7 +179,26 @@ while IFS="$tab" read -r id op payload; do
         reply "$id" error "cannot create read snapshot"
         continue
       }
-      if cp "$path" "$tmp" && token=$(file_token "$tmp") && valid_token "$token" && file_data=$(encode_file "$tmp"); then
+      if [ "$op" = read-snapshot-limited ]; then
+        # Read at most limit+1 bytes; never encode a truncated file as success.
+        # GNU/BSD/BusyBox head -c is required; unsupported tools fail closed.
+        if ! head -c "$((limit + 1))" <"$path" >"$tmp" 2>/dev/null; then
+          rm -f "$tmp"; tmp=
+          reply "$id" error "cannot read bounded snapshot (head -c required): $path"
+          continue
+        fi
+        size=$(wc -c <"$tmp")
+        if [ "$size" -gt "$limit" ]; then
+          rm -f "$tmp"; tmp=
+          reply "$id" error "snapshot exceeds byte limit; use explicit large-file confirmation: $path"
+          continue
+        fi
+      elif ! cp "$path" "$tmp"; then
+        rm -f "$tmp"; tmp=
+        reply "$id" error "cannot copy read snapshot: $path"
+        continue
+      fi
+      if token=$(file_token "$tmp") && valid_token "$token" && file_data=$(encode_file "$tmp"); then
         reply "$id" ok "$token$tab$file_data"
       else
         reply "$id" error "cannot snapshot file; sha256sum or shasum required: $path"

@@ -234,8 +234,26 @@ late replies; an already running remote read may still finish.
 
 The normal large-file limit applies before reading. From the original buffer,
 :SimpleRemoteCompare! explicitly permits a larger comparison; the bang never
-permits an overwrite. Size probing is advisory, not a hard transfer cap: a file
-can grow after probing, and snapshots/diff require full-file memory. No source
+permits an overwrite. With a positive g:simpleremote_large_file_bytes limit,
+the agent now reads at most limit+1 bytes into a temporary snapshot and rejects
+oversize contents before hashing or base64 transmission. This also protects
+ordinary virtual-buffer reads if a file grows after its initial size probe.
+A rejected snapshot is never displayed as a truncated success or used as a
+save baseline. The limit counts file bytes, not protocol/base64 overhead or
+total process memory. Snapshots and diff still require full-file memory.
+
+The bounded operation requires remote `head -c` support and a byte limit from
+1 through 2147483646; unsupported tools/agents or invalid limits fail closed.
+Update the plugin, daemon, and agent together. :SimpleRemoteLoad (after a large
+file is deferred), :SimpleRemoteCompare!, or setting the configured limit to
+zero explicitly permit an unbounded snapshot, subject to existing transport
+limits/timeouts. If a normal read is refused after growth, reopen the file to
+obtain its large-file prompt before using :SimpleRemoteLoad. This does not
+eliminate file-type-check/read races, blocking filesystem reads, or changes
+during/after the snapshot. Size probing can still fall back to wc -c and read
+the whole file if stat is unavailable; this is not a bound on all remote I/O
+or elapsed time. Explicit read APIs and projected files are outside
+this limit. No source
 save baseline is adopted by viewing or closing a comparison. To resolve a
 conflict, first preserve your local edits separately, deliberately reload the
 original, then reapply the desired edits and save against that fresh baseline.
@@ -243,8 +261,8 @@ There is no automatic merge, forced save, or recovery of a deleted remote file.
 
 The bundled agent requires `sha256sum` or `shasum` for virtual reads/saves; old
 agents or hash failures fail closed instead of silently overwriting. Update the
-plugin, daemon and installed agent together. JSON bridge protocol 2 supports
-conditional writes; an older daemon falls back to the legacy transport. Both
+plugin, daemon and installed agent together. JSON bridge protocol 3 supports
+conditional writes and bounded snapshots; an older daemon falls back to the legacy transport. Both
 paths perform full-file snapshots/hashing with O(n) memory/work, not incremental
 sync. Projected local/mounted files and explicit `SimpleRemoteWriteFile` calls
 retain their existing semantics and are outside this protection. Existing

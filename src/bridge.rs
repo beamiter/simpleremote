@@ -75,6 +75,8 @@ struct Request {
     content_b64: Option<String>,
     #[serde(default)]
     expected_token: Option<String>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
 }
 
 type Ops = Arc<Mutex<HashMap<u64, String>>>;
@@ -322,6 +324,14 @@ fn encode_payload(request: &Request) -> Result<String, String> {
         | "list-meta-encoded" => {
             reject_agent_field("path", &request.path)?;
             request.path.as_bytes().to_vec()
+        }
+        "read-snapshot-limited" => {
+            reject_agent_field("path", &request.path)?;
+            let limit = request.max_bytes.unwrap_or_default();
+            if !(1..=2_147_483_646).contains(&limit) {
+                return Err("snapshot requires max_bytes in 1..=2147483646".to_string());
+            }
+            format!("{limit}\t{}", request.path).into_bytes()
         }
         "exec" | "grep" => request.command.as_bytes().to_vec(),
         "write" | "write-checked" => {
@@ -596,6 +606,24 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(decode(&write), b"/f\taGkK");
+    }
+
+    #[test]
+    fn bounded_snapshot_validates_limit() {
+        let req = request(r#"{"id":7,"op":"read-snapshot-limited","path":"/f","max_bytes":10}"#);
+        assert_eq!(decode(&encode_payload(&req).unwrap()), b"10\t/f");
+        for limit in [0, 2_147_483_647, u64::MAX] {
+            let req = request(&format!(
+                r#"{{"id":7,"op":"read-snapshot-limited","path":"/f","max_bytes":{limit}}}"#
+            ));
+            assert!(encode_payload(&req).is_err());
+        }
+        assert!(
+            encode_payload(&request(
+                r#"{"id":7,"op":"read-snapshot-limited","path":"/f"}"#
+            ))
+            .is_err()
+        );
     }
 
     #[test]

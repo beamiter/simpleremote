@@ -23,7 +23,7 @@ const PROTOCOL = 'simpleremote/2'
 const SCRIPT_ROOT = fnamemodify(expand('<sfile>:p'), ':h:h')
 # The JSON bridge revision this Vim side speaks; the runtime advertises its own
 # in `simpleremote-daemon capabilities` and the two must agree.
-const BRIDGE_PROTOCOL = 2
+const BRIDGE_PROTOCOL = 3
 
 g:vimrc_remote_status = 'disconnected'
 g:simpleremote_status = 'disconnected'
@@ -189,6 +189,9 @@ def LegacyPayload(op: string, args: dict<any>): string
       .. (op ==# 'write-checked' ? get(args, 'expected_token', '') .. "\t" : '')
       .. (has_key(args, 'content_b64')
       ? args.content_b64 : B64(get(args, 'content', '')))
+  endif
+  if op ==# 'read-snapshot-limited'
+    return string(get(args, 'max_bytes', 0)) .. "\t" .. get(args, 'path', '')
   endif
   if op ==# 'exec' || op ==# 'grep'
     return get(args, 'command', '')
@@ -1109,9 +1112,11 @@ def ReadTimeoutFor(size: number): number
 enddef
 
 def StartRemoteRead(buf: number, generation: number, remote_path: string,
-    uri: string, timeout: number = -1)
+    uri: string, timeout: number = -1, max_bytes: number = -1)
   var request_id = 0
-  request_id = Send('read-snapshot', {path: remote_path}, (ok, body) => {
+  var limit = max_bytes < 0 ? LargeFileLimit() : max_bytes
+  request_id = Send(limit > 0 ? 'read-snapshot-limited' : 'read-snapshot',
+    {path: remote_path, max_bytes: limit}, (ok, body) => {
     var fields = split(body, "\t", true)
     if !ok || len(fields) != 2 || fields[0] !~# '^[0-9a-f]\{64}$'
       ApplyRemoteRead(buf, generation, request_id, remote_path, uri, false,
@@ -5436,7 +5441,8 @@ def g:SimpleRemoteCompare(force: bool = false)
       CompareError(target, 'Remote file exceeds the large-file limit. Run :SimpleRemoteCompare! from the original buffer to read it deliberately.')
       return
     endif
-    Send('read-snapshot', {path: info.path}, (read_ok, reply) => {
+    Send(limit > 0 ? 'read-snapshot-limited' : 'read-snapshot',
+      {path: info.path, max_bytes: limit}, (read_ok, reply) => {
       if !bufexists(target)
         return
       endif
@@ -5488,7 +5494,7 @@ def g:SimpleRemoteLoadBuffer()
   echomsg printf('[VimrcRemote] reading %s (%s)…',
     deferred.path, HumanBytes(deferred.size))
   StartRemoteRead(buf, deferred.generation, deferred.path, deferred.uri,
-    ReadTimeoutFor(deferred.size))
+    ReadTimeoutFor(deferred.size), 0)
 enddef
 
 def g:VimrcRemoteExec(command: string)

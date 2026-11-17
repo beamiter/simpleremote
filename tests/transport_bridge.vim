@@ -293,13 +293,62 @@ enddef
 # was declared for.  The buffer read types its payload list<string>, so a bare
 # message aborted the timeout timer with E1013 and hid the timeout itself.
 # Nothing here is protocol specific, so one transport proves it.
+def GrowthAfterProbeIsBounded()
+  var prior_agent = g:simpleremote_agent
+  var path = BASE .. '/growing.txt'
+  var flag = BASE .. '/grow-now'
+  var custom = BASE .. '/growth-agent.sh'
+  writefile(['small'], path)
+  var source = readfile(REPO .. '/bin/simpleremote-agent.sh')
+  insert(source, '      if [ -f ' .. shellescape(flag) .. ' ]; then printf %s ' .. shellescape(repeat('G', 500)) .. ' > ' .. shellescape(path) .. '; fi',
+    index(source, '    read-snapshot|read-snapshot-limited)') + 1)
+  writefile(source, custom)
+  g:simpleremote_agent_source = custom
+  g:simpleremote_agent = AGENT_DIR .. '/growth/simpleremote-agent.sh'
+  g:simpleremote_large_file_bytes = 64
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(Ready))
+  writefile(['grow'], flag)
+  messages clear
+  g:VimrcRemoteOpen(path)
+  assert_true(WaitFor(() => MessagesMatch('snapshot exceeds byte limit')))
+  assert_notequal(repeat('G', 500), getline(1), 'must not load an over-limit prefix/file')
+  assert_true(empty(get(b:, 'vimrc_remote', {})), 'failed snapshot cannot establish save baseline')
+  delete(flag)
+  writefile(['small'], path)
+  g:VimrcRemoteOpen(path)
+  assert_true(WaitFor(() => getline(1) ==# 'small'))
+  setline(1, 'local edits')
+  var original = bufnr()
+  var baseline = deepcopy(b:vimrc_remote)
+  writefile(['grow'], flag)
+  SimpleRemoteCompare
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'error'))
+  assert_match('snapshot exceeds byte limit', getline(2))
+  tabclose
+  assert_true(&modified)
+  assert_equal('local edits', getline(1))
+  assert_equal(baseline, b:vimrc_remote)
+  SimpleRemoteCompare!
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'ready'))
+  assert_equal(repeat('G', 500), getline(1))
+  tabclose
+  assert_equal(original, bufnr())
+  setlocal nomodified
+  silent! bwipeout!
+  SimpleRemoteDisconnect
+  unlet g:simpleremote_agent_source g:simpleremote_large_file_bytes
+  g:simpleremote_agent = prior_agent
+  delete(flag)
+enddef
+
 def ReadTimeoutIsReported()
   # Inject delay into the read operation itself: user commands now run on an
   # isolated transport and must no longer hold up the agent's file requests.
   var prior_agent = g:simpleremote_agent
   var slow_agent = BASE .. '/slow-agent.sh'
   var source = readfile(REPO .. '/bin/simpleremote-agent.sh')
-  insert(source, '      sleep 2', index(source, '    read-snapshot)') + 1)
+  insert(source, '      sleep 2', index(source, '    read-snapshot|read-snapshot-limited)') + 1)
   writefile(source, slow_agent)
   g:simpleremote_agent_source = slow_agent
   g:simpleremote_agent = AGENT_DIR .. '/slow/simpleremote-agent.sh'
@@ -547,7 +596,7 @@ enddef
 
 def Run()
   var capabilities = g:SimpleRemoteRuntimeCapabilities()
-  assert_equal(2, get(capabilities, 'bridge_protocol', 0),
+  assert_equal(3, get(capabilities, 'bridge_protocol', 0),
     'runtime does not advertise the bridge protocol')
   assert_true(index(get(capabilities, 'actions', []), 'upload') >= 0)
 
@@ -555,6 +604,7 @@ def Run()
   BundledAgentKeepsLegacyListingOperations()
   AgentRefusesSpecialWriteTargets()
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
+  GrowthAfterProbeIsBounded()
   ReadTimeoutIsReported()
   LargeFileWaitsForConfirmation()
 
@@ -563,6 +613,7 @@ def Run()
   g:simpleremote_use_daemon = 0
   g:simpleremote_agent = AGENT_DIR .. '/legacy/simpleremote-agent.sh'
   Exercise('legacy', AGENT_DIR .. '/legacy/simpleremote-agent.sh')
+  GrowthAfterProbeIsBounded()
   OldAgentListingFallbackWorks()
 
   # An installed agent that drifted is replaced on the next connection.
