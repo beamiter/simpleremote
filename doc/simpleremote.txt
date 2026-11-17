@@ -614,7 +614,7 @@ modelines.
 Close the comparison tab when finished. Edits made in the original while the
 request runs are preserved but do not update the frozen local copy. Remote
 changes after the read likewise need a fresh comparison. Missing/deleted files,
-size-probe failure, timeout, or disconnect show an error rather than an empty
+read failure, timeout, or disconnect show an error rather than an empty
 file that could be mistaken for a valid replacement. Closing the tab discards
 late replies; an already running remote read may still finish.
 
@@ -633,12 +633,16 @@ The bounded operation requires remote `head -c` support and a byte limit from
 Update the plugin, daemon, and agent together. :SimpleRemoteLoad (after a large
 file is deferred), :SimpleRemoteCompare!, or setting the configured limit to
 zero explicitly permit an unbounded snapshot, subject to existing transport
-limits/timeouts. If a normal read is refused after growth, reopen the file to
-obtain its large-file prompt before using :SimpleRemoteLoad. This does not
-eliminate file-type-check/read races, blocking filesystem reads, or changes
-during/after the snapshot. Size probing can still fall back to wc -c and read
-the whole file if stat is unavailable; this is not a bound on all remote I/O
-or elapsed time. Explicit read APIs and projected files are outside
+limits/timeouts. An over-limit read now offers :SimpleRemoteLoad directly,
+even when the file grew after probing or metadata tools are unavailable.
+The size probe uses only GNU/BSD stat metadata, never a whole-file wc scan.
+When metadata cannot be obtained, the snapshot operation still enforces the
+configured byte limit and reports read errors. Pending probe/read replies
+cannot replace text edited in the meantime, even if its modified flag was
+subsequently cleared. When the size is unknown, explicit loading uses the
+configured request timeout rather than a size-adjusted timeout. This does not
+eliminate file-type-check/read races, blocking filesystem operations, or changes
+during/after the snapshot, and is not a bound on all remote I/O or elapsed time. Explicit read APIs and projected files are outside
 this limit. No source
 save baseline is adopted by viewing or closing a comparison. To resolve a
 conflict, first preserve your local edits separately, deliberately reload the

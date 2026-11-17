@@ -175,7 +175,7 @@ def Exercise(protocol: string, agent: string)
   assert_false(filereadable(BASE .. '/utf8.txt'), protocol .. ': save must not recreate deleted file')
   SimpleRemoteCompare
   assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'error'))
-  assert_match('missing or inaccessible', getline(2))
+  assert_match('not a file', getline(2))
   tabclose
   assert_equal('keep local after remote deletion', getline(1))
   assert_true(&modified)
@@ -293,6 +293,72 @@ enddef
 # was declared for.  The buffer read types its payload list<string>, so a bare
 # message aborted the timeout timer with E1013 and hid the timeout itself.
 # Nothing here is protocol specific, so one transport proves it.
+def MetadataProbeSafety()
+  var prior_agent = g:simpleremote_agent
+  var path = BASE .. '/probe-safety.txt'
+  var no_stat = BASE .. '/no-stat'
+  var wc_called = BASE .. '/wc-called'
+  var custom = BASE .. '/metadata-agent.sh'
+  var source = readfile(REPO .. '/bin/simpleremote-agent.sh')
+  var hook = '      sleep 0.2; if [ -f ' .. shellescape(no_stat) .. ' ]; then command=' .. shellescape('stat() { return 1; }; wc() { printf called > ' .. shellescape(wc_called) .. '; return 99; }; ') .. '"$command"; fi'
+  insert(source, hook, index(source, '      run_command "$id" "$command"'))
+  insert(source, '      sleep 0.3', index(source, '    read-snapshot|read-snapshot-limited)') + 1)
+  writefile(source, custom)
+  g:simpleremote_agent_source = custom
+  g:simpleremote_agent = AGENT_DIR .. '/metadata/simpleremote-agent.sh'
+  g:simpleremote_large_file_bytes = 64
+  execute 'SimpleRemoteConnect ssh ' .. TARGET .. ' ' .. fnameescape(BASE)
+  assert_true(WaitFor(Ready))
+  writefile([repeat('P', 500)], path)
+  for clean in [false, true]
+    g:VimrcRemoteOpen(path)
+    setline(1, 'typed while stat pending')
+    if clean
+      setlocal nomodified
+    endif
+    assert_true(WaitFor(() => empty(get(b:, 'vimrc_remote_read', {}))))
+    assert_equal('typed while stat pending', getline(1))
+    assert_true(&modifiable)
+    assert_equal(!clean, &modified)
+    assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+    silent! bwipeout!
+  endfor
+  # No metadata tool: do not scan the file using wc; bounded read still works.
+  writefile(['no stat'], no_stat)
+  writefile(['small'], path)
+  g:VimrcRemoteOpen(path)
+  assert_true(WaitFor(() => getline(1) ==# 'small'))
+  assert_false(filereadable(wc_called))
+  SimpleRemoteCompare
+  assert_true(WaitFor(() => get(b:, 'simpleremote_compare_status', '') ==# 'ready'))
+  assert_equal('small', getline(1))
+  tabclose
+  silent! bwipeout!
+  writefile([repeat('P', 500)], path)
+  g:VimrcRemoteOpen(path)
+  assert_true(WaitFor(() => !empty(get(b:, 'vimrc_remote_deferred', {}))))
+  assert_false(filereadable(wc_called))
+  SimpleRemoteLoad
+  assert_true(WaitFor(() => getline(1) ==# repeat('P', 500)))
+  silent! bwipeout!
+  # An over-limit reply cannot replace edits made after the size probe either.
+  g:VimrcRemoteOpen(path)
+  var probe_id = b:vimrc_remote_read.request_id
+  assert_true(WaitFor(() => get(get(b:, 'vimrc_remote_read', {}), 'request_id', probe_id) != probe_id))
+  setline(1, 'typed while bounded read pending')
+  assert_true(WaitFor(() => empty(get(b:, 'vimrc_remote_read', {}))))
+  assert_equal('typed while bounded read pending', getline(1))
+  assert_true(&modified)
+  assert_true(&modifiable)
+  assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+  silent! bwipeout!
+  SimpleRemoteDisconnect
+  unlet g:simpleremote_agent_source g:simpleremote_large_file_bytes
+  g:simpleremote_agent = prior_agent
+  delete(no_stat)
+  delete(wc_called)
+enddef
+
 def GrowthAfterProbeIsBounded()
   var prior_agent = g:simpleremote_agent
   var path = BASE .. '/growing.txt'
@@ -314,6 +380,9 @@ def GrowthAfterProbeIsBounded()
   assert_true(WaitFor(() => MessagesMatch('snapshot exceeds byte limit')))
   assert_notequal(repeat('G', 500), getline(1), 'must not load an over-limit prefix/file')
   assert_true(empty(get(b:, 'vimrc_remote', {})), 'failed snapshot cannot establish save baseline')
+  assert_false(empty(get(b:, 'vimrc_remote_deferred', {})), 'growth refusal offers explicit Load immediately')
+  SimpleRemoteLoad
+  assert_true(WaitFor(() => getline(1) ==# repeat('G', 500)))
   delete(flag)
   writefile(['small'], path)
   g:VimrcRemoteOpen(path)
@@ -604,6 +673,7 @@ def Run()
   BundledAgentKeepsLegacyListingOperations()
   AgentRefusesSpecialWriteTargets()
   Exercise('json', AGENT_DIR .. '/json/simpleremote-agent.sh')
+  MetadataProbeSafety()
   GrowthAfterProbeIsBounded()
   ReadTimeoutIsReported()
   LargeFileWaitsForConfirmation()
@@ -613,6 +683,7 @@ def Run()
   g:simpleremote_use_daemon = 0
   g:simpleremote_agent = AGENT_DIR .. '/legacy/simpleremote-agent.sh'
   Exercise('legacy', AGENT_DIR .. '/legacy/simpleremote-agent.sh')
+  MetadataProbeSafety()
   GrowthAfterProbeIsBounded()
   OldAgentListingFallbackWorks()
 

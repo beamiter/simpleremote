@@ -985,6 +985,22 @@ def ResolveRemotePath(path: string): string
   return remote
 enddef
 
+# Both metadata probes and file replies can arrive after the user starts typing.
+def ReadCanReplace(buf: number, pending: dict<any>): bool
+  if getbufvar(buf, 'changedtick', -1) != get(pending, 'tick', -2)
+        || getbufvar(buf, '&modified')
+    Error('[VimrcRemote] read result ignored because the buffer changed')
+    return false
+  endif
+
+  var write = getbufvar(buf, 'vimrc_remote_write_state', {})
+  if type(write) == v:t_dict && get(write, 'status', '') ==# 'pending'
+    Error('[VimrcRemote] read result ignored while a remote write is pending')
+    return false
+  endif
+  return true
+enddef
+
 def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     remote_path: string, uri: string, ok: bool, body: list<string>, snapshot: string = '')
   if !IsCurrent(generation) || !bufexists(buf)
@@ -995,19 +1011,15 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
     return
   endif
   setbufvar(buf, 'vimrc_remote_read', {})
+  if !ReadCanReplace(buf, pending)
+    return
+  endif
   if !ok
-    Error('[VimrcRemote] ' .. join(body, ' '))
-    return
-  endif
-  if getbufvar(buf, 'changedtick', -1) != get(pending, 'tick', -2)
-        || getbufvar(buf, '&modified')
-    Error('[VimrcRemote] read result ignored because the buffer changed')
-    return
-  endif
-
-  var write = getbufvar(buf, 'vimrc_remote_write_state', {})
-  if type(write) == v:t_dict && get(write, 'status', '') ==# 'pending'
-    Error('[VimrcRemote] read result ignored while a remote write is pending')
+    var message = join(body, ' ')
+    Error('[VimrcRemote] ' .. message)
+    if message =~# '^snapshot exceeds byte limit;' && get(pending, 'limit', 0) > 0
+      DeferLargeRead(buf, generation, remote_path, uri, -1, pending.limit)
+    endif
     return
   endif
 
@@ -1077,8 +1089,8 @@ def HumanBytes(size: number): string
 enddef
 
 # stat is not in POSIX and its two dialects disagree on the flag, which is why
-# the agent's own listing walks the same chain. wc -c reads the file to answer,
-# so it is the last resort rather than the first choice.
+# we try both metadata-only forms. Never use wc here: it would scan an entire
+# file before the bounded snapshot guard can protect the connection.
 #
 # The agent runs a command with its stderr merged into its output, and a login
 # shell that greets one -- "bash: warning: setlocale: LC_ALL: cannot change
@@ -1088,8 +1100,7 @@ def SizeProbeCommand(remote_path: string): string
   var quoted = shellescape(remote_path)
   return 'printf ''simpleremote-size %s\n'' "$('
     .. 'stat -c %s ' .. quoted .. ' 2>/dev/null'
-    .. ' || stat -f %z ' .. quoted .. ' 2>/dev/null'
-    .. ' || wc -c < ' .. quoted .. ')"'
+    .. ' || stat -f %z ' .. quoted .. ' 2>/dev/null)"'
 enddef
 
 # The probed size, or -1 when the reply does not carry one.
@@ -1135,6 +1146,7 @@ def StartRemoteRead(buf: number, generation: number, remote_path: string,
     setbufvar(buf, 'vimrc_remote_read', {
       request_id: request_id,
       tick: getbufvar(buf, 'changedtick', -1),
+      limit: limit,
     })
   endif
 enddef
@@ -1162,12 +1174,12 @@ def DeferLargeRead(buf: number, generation: number, remote_path: string,
     'SimpleRemote: this file has not been read.',
     '',
     '  ' .. remote_path,
-    '  ' .. HumanBytes(size) .. ', over the ' .. HumanBytes(limit)
+    '  ' .. (size < 0 ? 'More than' : HumanBytes(size) .. ', over') .. ' the ' .. HumanBytes(limit)
       .. ' g:simpleremote_large_file_bytes limit.',
     '',
     '  A remote read arrives as one reply holding the whole file, so this',
     '  one would cross the transport and land in this buffer in full, with',
-    '  every request behind it waiting. Nothing has moved yet.',
+    '  every request behind it waiting. File content was not loaded.',
     '',
     '  <CR>  or  :SimpleRemoteLoad    read it into this buffer anyway',
     '  :bdelete                       leave it unread',
@@ -1193,8 +1205,12 @@ def FinishSizeProbe(buf: number, generation: number, request_id: number,
   if !IsCurrent(generation) || !bufexists(buf)
     return
   endif
-  if get(getbufvar(buf, 'vimrc_remote_read', {}), 'request_id', -1)
-      != request_id
+  var pending = getbufvar(buf, 'vimrc_remote_read', {})
+  if get(pending, 'request_id', -1) != request_id
+    return
+  endif
+  if !ReadCanReplace(buf, pending)
+    setbufvar(buf, 'vimrc_remote_read', {})
     return
   endif
   # A size that could not be read is no reason to hold the file back: the read
@@ -5433,10 +5449,8 @@ def g:SimpleRemoteCompare(force: bool = false)
       return
     endif
     var size = ok ? ParseProbedSize(body) : -1
-    if size < 0
-      CompareError(target, 'Cannot determine remote size (file missing or inaccessible).')
-      return
-    endif
+    # Missing stat support is not fatal: the bounded snapshot still enforces
+    # the limit and the file operation reports missing/inaccessible targets.
     if limit > 0 && size > limit
       CompareError(target, 'Remote file exceeds the large-file limit. Run :SimpleRemoteCompare! from the original buffer to read it deliberately.')
       return
@@ -5492,7 +5506,7 @@ def g:SimpleRemoteLoadBuffer()
   silent! nunmap <buffer> <CR>
   setlocal modifiable
   echomsg printf('[VimrcRemote] reading %s (%s)…',
-    deferred.path, HumanBytes(deferred.size))
+    deferred.path, deferred.size < 0 ? 'size unknown' : HumanBytes(deferred.size))
   StartRemoteRead(buf, deferred.generation, deferred.path, deferred.uri,
     ReadTimeoutFor(deferred.size), 0)
 enddef
