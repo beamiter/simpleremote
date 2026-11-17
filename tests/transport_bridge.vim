@@ -492,13 +492,41 @@ def LargeFileWaitsForConfirmation()
   assert_equal([repeat('L', 500)], readfile(BASE .. '/large.txt'),
     'writing a deferred buffer replaced the remote file')
 
+  # A failed explicit load retains its hint and can be retried without reopen.
+  var deferred_buf = bufnr()
+  delete(BASE .. '/large.txt')
   SimpleRemoteLoad
+  var first_request = b:vimrc_remote_read.request_id
+  SimpleRemoteLoad
+  assert_equal(first_request, b:vimrc_remote_read.request_id, 'duplicate Load replaced the active request')
+  assert_true(WaitFor(() => empty(get(b:, 'vimrc_remote_read', {}))))
+  assert_false(empty(get(b:, 'vimrc_remote_deferred', {})))
+  assert_false(&modifiable)
+  assert_match('SimpleRemoteLoad', maparg('<CR>', 'n'))
+  writefile([repeat('L', 500)], BASE .. '/large.txt')
+  SimpleRemoteLoad
+  hide enew
+  assert_true(WaitFor(() => getbufline(deferred_buf, 1) ==# [repeat('L', 500)]),
+    'hidden deferred load failed')
+  execute 'buffer ' .. deferred_buf
   assert_true(WaitFor(() => getline(1) ==# repeat('L', 500)),
     'the confirmed read did not land')
   assert_equal(BASE .. '/large.txt', get(get(b:, 'vimrc_remote', {}), 'path', ''))
   assert_true(&modifiable, 'the loaded buffer stayed read-only')
   assert_equal('', maparg('<CR>', 'n'), 'the confirmation mapping outlived it')
   assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+
+  # Reopening a deferred hint after shrink must recover without manual Load.
+  silent! bwipeout!
+  g:VimrcRemoteOpen(BASE .. '/large.txt')
+  assert_true(WaitFor(() => !empty(get(b:, 'vimrc_remote_deferred', {}))))
+  writefile(['shrunk'], BASE .. '/large.txt')
+  g:VimrcRemoteOpen(BASE .. '/large.txt')
+  assert_true(WaitFor(() => getline(1) ==# 'shrunk'), 'deferred reopen could not replace readonly hint')
+  assert_true(&modifiable)
+  assert_equal('', maparg('<CR>', 'n'))
+  assert_true(empty(get(b:, 'vimrc_remote_deferred', {})))
+  writefile([repeat('L', 500)], BASE .. '/large.txt')
 
   # Under the limit nothing changes: the file is simply there.
   g:simpleremote_large_file_bytes = 1048576
@@ -683,6 +711,7 @@ def Run()
   g:simpleremote_use_daemon = 0
   g:simpleremote_agent = AGENT_DIR .. '/legacy/simpleremote-agent.sh'
   Exercise('legacy', AGENT_DIR .. '/legacy/simpleremote-agent.sh')
+  LargeFileWaitsForConfirmation()
   MetadataProbeSafety()
   GrowthAfterProbeIsBounded()
   OldAgentListingFallbackWorks()

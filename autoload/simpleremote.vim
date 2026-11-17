@@ -1032,11 +1032,18 @@ def ApplyRemoteRead(buf: number, generation: number, request_id: number,
   elseif empty(lines)
     lines = ['']
   endif
+  var deferred = getbufvar(buf, 'vimrc_remote_deferred', {})
+  if type(deferred) == v:t_dict && !empty(deferred)
+    # Only our own hint makes a successful replacement writable.
+    setbufvar(buf, '&modifiable', 1)
+  endif
   var old_count = len(getbufline(buf, 1, '$'))
   setbufline(buf, 1, lines)
   if old_count > len(lines)
     deletebufline(buf, len(lines) + 1, old_count)
   endif
+  setbufvar(buf, 'vimrc_remote_deferred', {})
+  UnmapDeferredLoad(buf)
   setbufvar(buf, '&endofline', final_eol)
   setbufvar(buf, '&buftype', 'acwrite')
   setbufvar(buf, '&swapfile', 0)
@@ -1158,6 +1165,19 @@ def MapDeferredLoad(buf: number)
   if winid > 0
     win_execute(winid,
       'nnoremap <buffer><silent><nowait> <CR> <Cmd>SimpleRemoteLoad<CR>')
+    setbufvar(buf, 'vimrc_remote_load_map', true)
+  endif
+enddef
+
+# A hidden reply cannot use a window to unmap; activation completes cleanup.
+def UnmapDeferredLoad(buf: number)
+  if !getbufvar(buf, 'vimrc_remote_load_map', false)
+    return
+  endif
+  var winid = bufwinid(buf)
+  if winid > 0
+    win_execute(winid, "if maparg('<CR>', 'n') ==# '<Cmd>SimpleRemoteLoad<CR>'\n silent! nunmap <buffer> <CR>\nendif")
+    setbufvar(buf, 'vimrc_remote_load_map', false)
   endif
 enddef
 
@@ -1240,7 +1260,7 @@ def ReadRemote(uri: string)
   var buf = bufnr()
   var generation = s_remote.generation
   var remote_path = substitute(uri, '^remote://', '', '')
-  setbufvar(buf, 'vimrc_remote_deferred', {})
+  # Retain a deferred hint until replacement succeeds, including failed retries.
   var limit = LargeFileLimit()
   if limit <= 0
     StartRemoteRead(buf, generation, remote_path, uri)
@@ -5502,9 +5522,14 @@ def g:SimpleRemoteLoadBuffer()
     Error('[VimrcRemote] buffer belongs to an old connection; reopen it first')
     return
   endif
-  b:vimrc_remote_deferred = {}
-  silent! nunmap <buffer> <CR>
-  setlocal modifiable
+  if !empty(get(b:, 'vimrc_remote_read', {}))
+    Error('[VimrcRemote] a remote read is already pending')
+    return
+  endif
+  if &modified
+    Error('[VimrcRemote] refusing to replace edits in the deferred buffer')
+    return
+  endif
   echomsg printf('[VimrcRemote] reading %s (%s)…',
     deferred.path, deferred.size < 0 ? 'size unknown' : HumanBytes(deferred.size))
   StartRemoteRead(buf, deferred.generation, deferred.path, deferred.uri,
@@ -5608,6 +5633,7 @@ def g:VimrcRemoteActivateBuffer()
     MapDeferredLoad(bufnr())
     return
   endif
+  UnmapDeferredLoad(bufnr())
   var pending = get(b:, 'vimrc_remote_read', {})
   if !empty(pending)
     if !&modified

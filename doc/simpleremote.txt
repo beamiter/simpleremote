@@ -634,7 +634,11 @@ Update the plugin, daemon, and agent together. :SimpleRemoteLoad (after a large
 file is deferred), :SimpleRemoteCompare!, or setting the configured limit to
 zero explicitly permit an unbounded snapshot, subject to existing transport
 limits/timeouts. An over-limit read now offers :SimpleRemoteLoad directly,
-even when the file grew after probing or metadata tools are unavailable.
+even when the file grew after probing or metadata tools are unavailable. A deferred
+hint is retained until a replacement read succeeds: failed loads can be retried
+with :SimpleRemoteLoad, repeated requests are refused while a read is pending,
+and reopening after the file shrinks safely restores an editable buffer.
+Successful hidden loads remove their temporary Enter mapping on activation.
 The size probe uses only GNU/BSD stat metadata, never a whole-file wc scan.
 When metadata cannot be obtained, the snapshot operation still enforces the
 configured byte limit and reports read errors. Pending probe/read replies
